@@ -1,0 +1,4 @@
+websocket-client
+sounddevice
+opencv-python-headless
+numpy

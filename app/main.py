@@ -11,7 +11,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,9 +22,10 @@ from app.asr import (
     looks_like_speech,
     pcm16_to_float32,
     pick_device,
-    transcribe_pcm16,
 )
 from app.av_tse import SAMPLE_RATE, get_av_tse
+from app.pi_api import router as pi_router
+from app.pipeline import run_av_asr
 from app.video_pipeline import TMP_ROOT, process_mp4
 from app.vision import get_tracker
 
@@ -80,6 +80,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Detect Giọng Nói Demo", lifespan=lifespan)
+app.include_router(pi_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/tmp_audio", StaticFiles(directory=TMP_ROOT), name="tmp_audio")
 
@@ -142,27 +143,7 @@ async def no_cache_static(request, call_next):
 
 
 def _run_av_asr(pcm_bytes: bytes, face_crops: list) -> tuple[str, bool]:
-    """AV-TSE extract then PhoWhisper. Returns (text, used_tse)."""
-    audio = pcm16_to_float32(pcm_bytes)
-    if not looks_like_speech(audio, SAMPLE_RATE):
-        return "", False
-
-    used_tse = False
-    if face_crops and BOOT.get("av_tse_ready"):
-        try:
-            extracted = get_av_tse().extract(audio, face_crops)
-            audio = extracted
-            used_tse = True
-        except Exception:
-            logger.exception("AV-TSE failed; using raw mic")
-
-    audio = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
-    if not looks_like_speech(audio, SAMPLE_RATE):
-        return "", used_tse
-
-    pcm = (audio * 32767.0).astype(np.int16).tobytes()
-    text = clean_transcript(transcribe_pcm16(pcm, sample_rate=SAMPLE_RATE))
-    return text, used_tse
+    return run_av_asr(pcm_bytes, face_crops, use_tse=bool(BOOT.get("av_tse_ready")))
 
 
 @app.websocket("/ws")
