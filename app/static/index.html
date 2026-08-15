@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Detect Giọng Nói — AV-TSE Demo</title>
+    <link rel="stylesheet" href="/static/style.css?v=6" />
+  </head>
+  <body>
+    <div class="bg"></div>
+    <main class="shell">
+      <header class="top">
+        <div class="brand">
+          <span class="mark"></span>
+          <div>
+            <h1>Detect Giọng Nói</h1>
+            <p>MP4 / Camera → AV-TSE tách giọng → PhoWhisper (VI)</p>
+          </div>
+        </div>
+        <div class="meta" id="meta">Đang kết nối server…</div>
+      </header>
+
+      <div id="banner" class="banner">Đang kiểm tra model…</div>
+
+      <section class="stage">
+        <div class="video-wrap">
+          <div id="videoPlaceholder" class="placeholder">Chọn MP4 hoặc mở camera</div>
+          <video id="video" playsinline controls muted></video>
+          <canvas id="overlay"></canvas>
+          <div class="hud">
+            <span id="faceStatus" class="pill">Chưa thấy mặt</span>
+            <span id="speakStatus" class="pill muted">Miệng im</span>
+            <span id="tseStatus" class="pill muted">AV-TSE idle</span>
+          </div>
+        </div>
+
+        <aside class="panel">
+          <div class="upload-box">
+            <div class="label">Thử với video MP4</div>
+            <input id="videoFile" type="file" accept="video/mp4,video/quicktime,video/webm,video/*" />
+            <button id="processVideoBtn" class="primary" disabled>Chạy AV-TSE + ASR</button>
+            <audio id="tseAudio" controls style="width:100%; margin-top:10px; display:none"></audio>
+          </div>
+
+          <div class="controls">
+            <button id="startBtn" class="primary alt" disabled>Mở cam/mic & nghe</button>
+            <button id="listenBtn" class="ghost" disabled>Bắt đầu nghe</button>
+            <button id="stopBtn" class="ghost" disabled>Dừng</button>
+            <button id="flushBtn" class="ghost" disabled>Chốt câu</button>
+          </div>
+
+          <label class="toggle">
+            <input type="checkbox" id="requireSpeaking" checked />
+            Chỉ nhận khi môi đang cử động (tránh chữ nhảy lúc im)
+          </label>
+
+          <div class="level">
+            <span>Mic</span>
+            <div class="bar"><i id="levelBar"></i></div>
+          </div>
+
+          <div class="transcript-box">
+            <div class="label">Transcript tiếng Việt</div>
+            <div id="transcript" class="transcript">
+              Upload MP4 có mặt người nói tiếng Việt, rồi bấm <strong>Chạy AV-TSE + ASR</strong>.
+            </div>
+          </div>
+
+          <ul class="tips">
+            <li>Video demo: tối đa ~30 giây đầu</li>
+            <li>AV-TSE: <code>AV_MossFormer2_TSE_16K</code></li>
+            <li>ASR: <code>vinai/PhoWhisper-small</code></li>
+          </ul>
+        </aside>
+      </section>
+    </main>
+
+    <script>
+      (function boot() {
+        var meta = document.getElementById("meta");
+        var banner = document.getElementById("banner");
+        var startBtn = document.getElementById("startBtn");
+        var processVideoBtn = document.getElementById("processVideoBtn");
+        var tries = 0;
+        function paint(h) {
+          if (!h) return;
+          if (h.ready) {
+            meta.textContent = (h.av_tse_model || "AV-TSE") + " + " + (h.asr_model || "ASR") + " · " + (h.device || "");
+            banner.className = "banner ok";
+            banner.innerHTML = "Model sẵn sàng. Upload <strong>MP4</strong> rồi bấm <strong>Chạy AV-TSE + ASR</strong>.";
+            startBtn.disabled = false;
+            processVideoBtn.disabled = false;
+            window.__modelsReady = true;
+            return true;
+          }
+          if (h.error) {
+            meta.textContent = "Lỗi load model";
+            banner.className = "banner error";
+            banner.innerHTML = "Lỗi: <code>" + h.error + "</code>";
+            return false;
+          }
+          meta.textContent = [
+            h.asr_ready ? "ASR✓" : "ASR…",
+            h.vision_ready ? "Face✓" : "Face…",
+            h.av_tse_ready ? "TSE✓" : "TSE…"
+          ].join(" ") + " · " + (h.device || "?");
+          banner.className = "banner";
+          banner.innerHTML = "Đang load model: <strong>" + (h.stage || "…") + "</strong>";
+          startBtn.disabled = true;
+          processVideoBtn.disabled = true;
+          return false;
+        }
+        function tick() {
+          tries += 1;
+          fetch("/health?t=" + Date.now(), { cache: "no-store" })
+            .then(function (r) { return r.json(); })
+            .then(function (h) {
+              if (!paint(h) && tries < 180) setTimeout(tick, 1000);
+            })
+            .catch(function () {
+              meta.textContent = "Không kết nối được server";
+              banner.className = "banner error";
+              banner.innerHTML = "Không gọi được <code>/health</code> tại " + location.origin;
+              if (tries < 180) setTimeout(tick, 1500);
+            });
+        }
+        tick();
+      })();
+    </script>
+    <script src="/static/app.js?v=6"></script>
+  </body>
+</html>

@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+models/*.task
+checkpoints/
+.cache/
+tmp/
+app/tmp/
+*.wav
+*.webm

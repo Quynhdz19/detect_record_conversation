@@ -1,0 +1,13 @@
+torch
+torchaudio
+transformers
+accelerate
+fastapi
+uvicorn[standard]
+python-multipart
+numpy
+scipy
+opencv-python-headless
+mediapipe
+soundfile
+clearvoice
