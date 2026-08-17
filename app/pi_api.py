@@ -27,6 +27,7 @@ from fastapi import (
 from app.asr import MODEL_ID, clean_transcript, looks_like_speech, pcm16_to_float32, pick_device
 from app.av_tse import SAMPLE_RATE
 from app.conversation import append_turn, create_session, get_session
+from app.live import LiveStream, infer_window
 from app.pipeline import run_av_asr
 from app.vision import get_tracker
 
@@ -221,14 +222,9 @@ async def pi_ws(
     session_id = sess["session_id"]
 
     sample_rate = SAMPLE_RATE
-    audio_buf = bytearray()
-    face_crops: list[Any] = []
+    live = LiveStream(sr=sample_rate)
     last_face: dict[str, Any] = {"found": False}
-    last_transcript_at = 0.0
-    last_text = ""
-    chunk_sec = 3.0
     require_speaking = True
-    busy = False
     loop = asyncio.get_event_loop()
 
     await websocket.send_json(
@@ -239,50 +235,74 @@ async def pi_ws(
             "asr_model": MODEL_ID,
             "device": pick_device()[0],
             "protocol": "websocket",
+            "mode": "live",
         }
     )
     last_ping = time.time()
 
+    def _preview(partial: str) -> str:
+        base = (sess or {}).get("conversation") or ""
+        if not partial:
+            return base
+        return f"{base}\n{partial}".strip() if base else partial
+
     async def process_chunk(final: bool = False) -> None:
-        nonlocal audio_buf, face_crops, last_transcript_at, last_text, busy, sess
-        if busy:
+        nonlocal sess
+        if live.busy or live.buf_sec() < 0.7:
             return
-        min_bytes = int(sample_rate * 1.2) * 2
-        if len(audio_buf) < min_bytes:
-            return
-        chunk = bytes(audio_buf)
-        if not looks_like_speech(pcm16_to_float32(chunk), sample_rate):
-            audio_buf.clear()
-            face_crops.clear()
-            await websocket.send_json({"type": "status", "text": "silence"})
-            return
-        busy = True
-        crops = list(face_crops)
-        overlap = int(sample_rate * 0.35) * 2
-        audio_buf[:] = audio_buf[-overlap:]
-        face_crops.clear()
+        chunk, crops = live.snapshot()
+        live.busy = True
+        live.last_decode_at = time.time()
         try:
+            use_tse = final and bool(_boot().get("av_tse_ready"))
+            if not looks_like_speech(pcm16_to_float32(chunk), sample_rate):
+                if final:
+                    live.discard()
+                    await websocket.send_json({"type": "status", "text": "silence"})
+                elif live.buf_sec() > 2.0:
+                    keep = int(sample_rate * 0.4) * 2
+                    live.buf[:] = live.buf[-keep:]
+                return
+            live.had_speech = True
             text, used_tse = await loop.run_in_executor(
-                None, run_av_asr, chunk, crops, bool(_boot().get("av_tse_ready"))
+                None, infer_window, chunk, crops, use_tse, final
             )
-            text = clean_transcript(text)
-            if text and text.lower() != last_text.lower():
-                last_text = text
-                last_transcript_at = time.time()
+            text = clean_transcript(text, final=final)
+            if not text:
+                if final:
+                    live.commit()
+                return
+            if not final and text.lower() == live.last_text.lower():
+                return
+            live.last_text = text
+            if final:
                 sess = append_turn(session_id, text, used_tse=used_tse) or sess
-                await websocket.send_json(
-                    {
-                        "type": "transcript",
-                        "text": text,
-                        "final": final,
-                        "used_tse": used_tse,
-                        "session_id": session_id,
-                        "conversation": sess.get("conversation", ""),
-                        "turns": sess.get("turns", []),
-                    }
-                )
+                conversation = sess.get("conversation", "")
+                turns = sess.get("turns", [])
+                live.commit()
+            else:
+                conversation = _preview(text)
+                turns = (sess or {}).get("turns", [])
+            await websocket.send_json(
+                {
+                    "type": "transcript",
+                    "text": text,
+                    "final": final,
+                    "used_tse": used_tse,
+                    "session_id": session_id,
+                    "conversation": conversation,
+                    "turns": turns,
+                }
+            )
         finally:
-            busy = False
+            live.busy = False
+
+    async def maybe_decode() -> None:
+        now = time.time()
+        if live.want_len_final() or live.want_silence_final(now):
+            await process_chunk(final=True)
+        elif live.want_partial(now):
+            await process_chunk(final=False)
 
     try:
         while True:
@@ -292,6 +312,7 @@ async def pi_ws(
             try:
                 message = await asyncio.wait_for(websocket.receive(), timeout=0.25)
             except asyncio.TimeoutError:
+                await maybe_decode()
                 continue
             if message.get("type") == "websocket.disconnect":
                 break
@@ -324,25 +345,35 @@ async def pi_ws(
                 last_face = {
                     "found": cue.found,
                     "speaking": cue.speaking,
+                    "lip_active": getattr(cue, "lip_active", False),
+                    "asd_score": getattr(cue, "asd_score", 0.0),
                     "x": cue.x,
                     "y": cue.y,
                     "w": cue.w,
                     "h": cue.h,
                 }
                 if cue.found and cue.face_bgr is not None:
-                    face_crops.append(cue.face_bgr)
-                    if len(face_crops) > 40:
-                        face_crops = face_crops[-40:]
+                    live.push_crop(cue.face_bgr)
                 await websocket.send_json({"type": "face", **last_face})
+                if require_speaking and last_face.get("found") and not last_face.get("speaking"):
+                    if live.had_speech:
+                        await maybe_decode()
+                    else:
+                        live.discard()
+                else:
+                    await maybe_decode()
                 continue
             if tag != 2:
                 continue
+            get_tracker().note_pcm16(payload, time.time())
             if require_speaking and last_face.get("found") and not last_face.get("speaking"):
+                if live.had_speech:
+                    await maybe_decode()
+                else:
+                    live.discard()
                 continue
-            audio_buf.extend(payload)
-            buf_sec = len(audio_buf) / (sample_rate * 2)
-            if buf_sec >= chunk_sec and (time.time() - last_transcript_at) > 0.8:
-                await process_chunk(final=False)
+            live.push_audio(payload, time.time())
+            await maybe_decode()
     except WebSocketDisconnect:
         logger.info("Pi WS disconnected session=%s", session_id)
     except Exception:

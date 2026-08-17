@@ -146,11 +146,18 @@
       ws.onmessage = (ev) => {
         const msg = JSON.parse(ev.data);
         if (msg.type === "ready") {
-          setMeta(`${msg.av_tse_model} + ${msg.asr_model} · ${msg.device}`);
+          setMeta(`${msg.av_tse_model} + ${msg.asr_model} · ${msg.device} · live`);
         } else if (msg.type === "face") {
           face = msg;
           faceStatus.textContent = msg.found ? "Đã khóa mặt" : "Chưa thấy mặt";
-          speakStatus.textContent = msg.speaking ? "Miệng đang cử động" : "Miệng im";
+          if (msg.speaking) {
+            const sc = msg.asd_score != null ? Number(msg.asd_score).toFixed(1) : "";
+            speakStatus.textContent = sc ? `TalkNet đang nói (${sc})` : "Đang nói";
+          } else if (msg.lip_active) {
+            speakStatus.textContent = "Môi nhúc — TalkNet chưa xác nhận";
+          } else {
+            speakStatus.textContent = "Không nói";
+          }
           speakStatus.classList.toggle("hot", !!msg.speaking);
           speakStatus.classList.toggle("muted", !msg.speaking);
           drawFace();
@@ -206,7 +213,12 @@
     // Try full constraints, then relax, then split audio/video
     const attempts = [
       {
-        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: true,
+          channelCount: 1,
+        },
         video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
       },
       { audio: true, video: { facingMode: "user" } },
@@ -288,12 +300,7 @@
 
       processor.onaudioprocess = (e) => {
         if (!listening) return;
-        if (requireSpeaking.checked && face && face.found && !face.speaking) return;
         const input = e.inputBuffer.getChannelData(0);
-        let sum = 0;
-        for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
-        const rms = Math.sqrt(sum / input.length);
-        if (rms < 0.012) return;
         const down = downsampleTo16k(input, audioCtx.sampleRate);
         sendBinary(2, floatTo16BitPCM(down));
       };
@@ -342,7 +349,7 @@
     listenBtn.disabled = true;
     flushBtn.disabled = false;
     if (frameTimer) clearInterval(frameTimer);
-    frameTimer = setInterval(sendVideoFrame, 160);
+    frameTimer = setInterval(sendVideoFrame, 80);
     setBanner("Đang stream camera/mic → AV-TSE → PhoWhisper.", "ok");
   }
 

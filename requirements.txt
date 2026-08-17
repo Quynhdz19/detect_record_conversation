@@ -11,3 +11,4 @@ opencv-python-headless
 mediapipe
 soundfile
 clearvoice
+python_speech_features

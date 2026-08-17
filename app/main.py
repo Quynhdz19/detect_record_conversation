@@ -24,8 +24,8 @@ from app.asr import (
     pick_device,
 )
 from app.av_tse import SAMPLE_RATE, get_av_tse
+from app.live import LiveStream, infer_window
 from app.pi_api import router as pi_router
-from app.pipeline import run_av_asr
 from app.video_pipeline import TMP_ROOT, process_mp4
 from app.vision import get_tracker
 
@@ -42,6 +42,7 @@ BOOT: dict[str, Any] = {
     "asr_ready": False,
     "vision_ready": False,
     "av_tse_ready": False,
+    "asd_ready": False,
 }
 
 
@@ -61,6 +62,17 @@ def _warm_models() -> None:
         logger.info("Warming AV-TSE AV_MossFormer2_TSE_16K...")
         get_av_tse()
         BOOT["av_tse_ready"] = True
+
+        try:
+            BOOT["stage"] = "loading TalkNet-ASD (TalkSet)"
+            logger.info("Warming TalkNet-ASD…")
+            from app.asd import get_talknet
+
+            get_talknet()
+            BOOT["asd_ready"] = True
+        except Exception:
+            logger.exception("TalkNet warm-up failed; using lip VAD fallback")
+            BOOT["asd_ready"] = False
 
         BOOT["stage"] = "ready"
         BOOT["ready"] = True
@@ -103,8 +115,10 @@ async def health():
         "asr_ready": BOOT["asr_ready"],
         "vision_ready": BOOT["vision_ready"],
         "av_tse_ready": BOOT["av_tse_ready"],
+        "asd_ready": BOOT.get("asd_ready", False),
         "asr_model": MODEL_ID,
         "av_tse_model": "AV_MossFormer2_TSE_16K",
+        "asd_model": "TalkNet-ASD TalkSet",
         "device": device,
         "dtype": dtype,
     }
@@ -142,22 +156,13 @@ async def no_cache_static(request, call_next):
 
 
 
-def _run_av_asr(pcm_bytes: bytes, face_crops: list) -> tuple[str, bool]:
-    return run_av_asr(pcm_bytes, face_crops, use_tse=bool(BOOT.get("av_tse_ready")))
-
-
 @app.websocket("/ws")
 async def ws_session(websocket: WebSocket):
     await websocket.accept()
     sample_rate = SAMPLE_RATE
-    audio_buf = bytearray()
-    face_crops: list[Any] = []
+    live = LiveStream(sr=sample_rate)
     last_face: dict[str, Any] = {"found": False}
-    last_transcript_at = 0.0
-    last_text = ""
-    chunk_sec = 3.0
     require_speaking = True
-    busy = False
     loop = asyncio.get_event_loop()
 
     # Wait briefly if models still loading
@@ -187,39 +192,39 @@ async def ws_session(websocket: WebSocket):
             "device": pick_device()[0],
             "sample_rate": sample_rate,
             "av_tse_ready": BOOT["av_tse_ready"],
+            "mode": "live",
         }
     )
 
     async def process_chunk(final: bool = False) -> None:
-        nonlocal audio_buf, face_crops, last_transcript_at, last_text, busy
-        if busy:
-            return
-        min_bytes = int(sample_rate * 1.2) * 2
-        if len(audio_buf) < min_bytes:
+        if live.busy or live.buf_sec() < 0.7:
             return
         if not BOOT["asr_ready"]:
-            await websocket.send_json(
-                {"type": "status", "text": "ASR chưa sẵn sàng…"}
-            )
+            await websocket.send_json({"type": "status", "text": "ASR chưa sẵn sàng…"})
             return
-        chunk = bytes(audio_buf)
-        if not looks_like_speech(pcm16_to_float32(chunk), sample_rate):
-            audio_buf.clear()
-            face_crops.clear()
-            await websocket.send_json({"type": "status", "text": "Im lặng — bỏ qua"})
-            return
-        busy = True
-        crops = list(face_crops)
-        overlap = int(sample_rate * 0.35) * 2
-        audio_buf[:] = audio_buf[-overlap:]
-        face_crops.clear()
+        chunk, crops = live.snapshot()
+        live.busy = True
+        live.last_decode_at = time.time()
         try:
-            await websocket.send_json({"type": "status", "text": "AV-TSE đang tách giọng…"})
-            text, used_tse = await loop.run_in_executor(None, _run_av_asr, chunk, crops)
-            text = clean_transcript(text)
-            if text and text.lower() != last_text.lower():
-                last_text = text
-                last_transcript_at = time.time()
+            use_tse = final and bool(BOOT.get("av_tse_ready"))
+            if not looks_like_speech(pcm16_to_float32(chunk), sample_rate):
+                if final:
+                    live.discard()
+                    await websocket.send_json({"type": "status", "text": "Im lặng — bỏ qua"})
+                elif live.buf_sec() > 2.0:
+                    keep = int(sample_rate * 0.4) * 2
+                    live.buf[:] = live.buf[-keep:]
+                return
+            live.had_speech = True
+            await websocket.send_json(
+                {"type": "status", "text": "Đang nhận chữ…" if not final else "AV-TSE đang tách giọng…"}
+            )
+            text, used_tse = await loop.run_in_executor(
+                None, infer_window, chunk, crops, use_tse, final
+            )
+            text = clean_transcript(text, final=final)
+            if text and (final or text.lower() != live.last_text.lower()):
+                live.last_text = text
                 await websocket.send_json(
                     {
                         "type": "transcript",
@@ -229,9 +234,18 @@ async def ws_session(websocket: WebSocket):
                         "face": last_face,
                     }
                 )
+            if final:
+                live.commit()
             await websocket.send_json({"type": "status", "text": "Đang nghe…"})
         finally:
-            busy = False
+            live.busy = False
+
+    async def maybe_decode() -> None:
+        now = time.time()
+        if live.want_len_final() or live.want_silence_final(now):
+            await process_chunk(final=True)
+        elif live.want_partial(now):
+            await process_chunk(final=False)
 
     try:
         while True:
@@ -268,27 +282,36 @@ async def ws_session(websocket: WebSocket):
                     "h": cue.h,
                     "mouth_open": cue.mouth_open,
                     "speaking": cue.speaking,
+                    "lip_active": cue.lip_active,
+                    "asd_score": getattr(cue, "asd_score", 0.0),
                     "cx": cue.cx,
                     "cy": cue.cy,
                 }
                 if cue.found and cue.face_bgr is not None:
-                    face_crops.append(cue.face_bgr)
-                    if len(face_crops) > 40:
-                        face_crops = face_crops[-40:]
+                    live.push_crop(cue.face_bgr)
                 await websocket.send_json({"type": "face", **last_face})
+                if require_speaking and last_face.get("found") and not last_face.get("speaking"):
+                    if live.had_speech:
+                        await maybe_decode()
+                    else:
+                        live.discard()
+                else:
+                    await maybe_decode()
                 continue
 
             if tag != 2:
                 continue
 
+            get_tracker().note_pcm16(payload, time.time())
             if require_speaking and last_face.get("found") and not last_face.get("speaking"):
+                if live.had_speech:
+                    await maybe_decode()
+                else:
+                    live.discard()
                 continue
 
-            audio_buf.extend(payload)
-            buf_sec = len(audio_buf) / (sample_rate * 2)
-            now = time.time()
-            if buf_sec >= chunk_sec and (now - last_transcript_at) > 0.8:
-                await process_chunk(final=False)
+            live.push_audio(payload, time.time())
+            await maybe_decode()
 
     except WebSocketDisconnect:
         logger.info("Client disconnected")

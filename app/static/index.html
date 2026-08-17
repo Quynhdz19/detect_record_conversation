@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Detect Giọng Nói — AV-TSE Demo</title>
-    <link rel="stylesheet" href="/static/style.css?v=6" />
+    <link rel="stylesheet" href="/static/style.css?v=10" />
   </head>
   <body>
     <div class="bg"></div>
@@ -67,7 +67,7 @@
           </div>
 
           <ul class="tips">
-            <li>Video demo: tối đa ~30 giây đầu</li>
+            <li>Live: chữ hiện khi đang nói (~1s), chốt câu khi ngừng</li>
             <li>AV-TSE: <code>AV_MossFormer2_TSE_16K</code></li>
             <li>ASR: <code>vinai/PhoWhisper-small</code></li>
           </ul>
@@ -102,7 +102,8 @@
           meta.textContent = [
             h.asr_ready ? "ASR✓" : "ASR…",
             h.vision_ready ? "Face✓" : "Face…",
-            h.av_tse_ready ? "TSE✓" : "TSE…"
+            h.av_tse_ready ? "TSE✓" : "TSE…",
+            h.asd_ready ? "TalkNet✓" : "TalkNet…"
           ].join(" ") + " · " + (h.device || "?");
           banner.className = "banner";
           banner.innerHTML = "Đang load model: <strong>" + (h.stage || "…") + "</strong>";
@@ -127,6 +128,6 @@
         tick();
       })();
     </script>
-    <script src="/static/app.js?v=6"></script>
+    <script src="/static/app.js?v=10"></script>
   </body>
 </html>

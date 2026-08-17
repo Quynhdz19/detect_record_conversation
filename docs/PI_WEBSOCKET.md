@@ -218,7 +218,7 @@ ws.send(b"\x02" + pcm16_bytes, opcode=2)  # binary frame
 ### Video
 
 - JPEG, mặt người nói càng rõ càng tốt (AV-TSE dùng face/lip)
-- Không cần gửi full 30 fps; **6 fps là đủ**
+- **~12 fps** để bắt môi đang nói (6 fps dễ nhầm jitter với nói)
 - Gửi binary:
 
 ```python
@@ -270,9 +270,11 @@ Socket OK, bắt đầu gửi cam/mic.
 | `text` | Câu vừa nhận (một lượt) |
 | `conversation` | **Toàn bộ hội thoại**, mỗi câu một dòng — ưu tiên hiển thị cái này |
 | `turns` | Mảng câu có timestamp |
-| `final` | `true` nếu Pi vừa `flush` |
+| `final` | `false` = chữ tạm (đang nói, **thay dòng hiện tại**). `true` = chốt câu (ngừng nói / `flush` / đủ ~6s) |
 
-Im lặng **không** gửi `transcript`.
+Server chạy **live cửa sổ trượt**: partial ~0.6–1s/lần (ASR nhanh, chưa TSE), `final` mới chạy AV-TSE. Chỉ `append` hội thoại khi `final=true`.
+
+Im lặng **không** gửi `transcript` mới (trừ khi chốt câu đã có chữ tạm).
 
 ### `status`
 

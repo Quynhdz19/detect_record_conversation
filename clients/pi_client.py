@@ -140,10 +140,14 @@ class PiStreamer:
                 self.session_id = data.get("session_id") or self.session_id
                 print("WS ready session=", self.session_id)
             elif kind == "transcript":
-                print(">>", data.get("text"))
-                conv = data.get("conversation") or ""
-                if conv:
-                    print("--- hội thoại ---\n" + conv + "\n")
+                text = data.get("text") or ""
+                if data.get("final"):
+                    print(">>", text)
+                    conv = data.get("conversation") or ""
+                    if conv:
+                        print("--- hội thoại ---\n" + conv + "\n")
+                else:
+                    print("\r…", text, end="   ", flush=True)
             elif kind == "error":
                 print("server error:", data.get("text"))
             elif kind == "ping":
@@ -191,7 +195,7 @@ def main() -> None:
     p.add_argument("--session-id", default="", help="reconnect cùng hội thoại")
     p.add_argument("--token", default="")
     p.add_argument("--camera", type=int, default=0)
-    p.add_argument("--fps", type=float, default=6.0)
+    p.add_argument("--fps", type=float, default=12.0)
     p.add_argument("--jpeg-quality", type=int, default=70)
     p.add_argument("--reconnect", action="store_true", default=True)
     args = p.parse_args()

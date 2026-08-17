@@ -61,12 +61,14 @@ def pcm16_to_float32(pcm_bytes: bytes) -> np.ndarray:
     return audio / 32768.0
 
 
-# Whisper often invents these on silence / noise
+# Whisper invents these on silence / room noise
 _HALLUCINATION_EXACT = {
     "cảm ơn",
     "cảm ơn bạn",
     "cảm ơn các bạn",
+    "cảm ơn các bạn đã theo dõi",
     "xin chào",
+    "xin chào các bạn",
     "hẹn gặp lại",
     "tạm biệt",
     "bạn",
@@ -84,6 +86,14 @@ _HALLUCINATION_EXACT = {
     ".",
     "...",
     "…",
+}
+
+_GREETING_OK_ON_FINAL = {
+    "xin chào",
+    "cảm ơn",
+    "cảm ơn bạn",
+    "hẹn gặp lại",
+    "tạm biệt",
 }
 
 _HALLUCINATION_SUBSTR = (
@@ -117,10 +127,10 @@ def speech_stats(audio: np.ndarray, sample_rate: int = 16000) -> dict:
 def looks_like_speech(audio: np.ndarray, sample_rate: int = 16000) -> bool:
     """Reject silence / faint room noise before calling ASR."""
     s = speech_stats(audio, sample_rate)
-    return s["peak"] >= 0.055 and s["rms"] >= 0.010 and s["voiced_ratio"] >= 0.12
+    return s["peak"] >= 0.048 and s["rms"] >= 0.009 and s["voiced_ratio"] >= 0.14
 
 
-def clean_transcript(text: str) -> str:
+def clean_transcript(text: str, *, final: bool = False) -> str:
     raw = (text or "").strip()
     if not raw:
         return ""
@@ -128,13 +138,14 @@ def clean_transcript(text: str) -> str:
     lower = collapsed.lower().strip(" .,-!?…\"'")
     if not lower or len(lower) < 2:
         return ""
-    if lower in _HALLUCINATION_EXACT:
-        return ""
     if any(p in lower for p in _HALLUCINATION_SUBSTR):
         return ""
-    # repeated token: "à à à à"
     parts = lower.split()
     if len(parts) >= 3 and len(set(parts)) == 1:
+        return ""
+    if lower in _HALLUCINATION_EXACT:
+        if final and lower in _GREETING_OK_ON_FINAL:
+            return collapsed
         return ""
     return collapsed
 
@@ -143,6 +154,7 @@ def transcribe_pcm16(
     pcm_bytes: bytes,
     sample_rate: int = 16000,
     language: Optional[str] = "vi",
+    final: bool = False,
 ) -> str:
     if len(pcm_bytes) < sample_rate:  # < ~0.5s of int16 mono
         return ""
@@ -165,4 +177,4 @@ def transcribe_pcm16(
         generate_kwargs=generate_kwargs,
         return_timestamps=False,
     )
-    return clean_transcript(result.get("text") or "")
+    return clean_transcript(result.get("text") or "", final=final)
