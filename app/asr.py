@@ -127,7 +127,7 @@ def speech_stats(audio: np.ndarray, sample_rate: int = 16000) -> dict:
 def looks_like_speech(audio: np.ndarray, sample_rate: int = 16000) -> bool:
     """Reject silence / faint room noise before calling ASR."""
     s = speech_stats(audio, sample_rate)
-    return s["peak"] >= 0.048 and s["rms"] >= 0.009 and s["voiced_ratio"] >= 0.14
+    return s["peak"] >= 0.032 and s["rms"] >= 0.005 and s["voiced_ratio"] >= 0.08
 
 
 def clean_transcript(text: str, *, final: bool = False) -> str:
@@ -156,7 +156,7 @@ def transcribe_pcm16(
     language: Optional[str] = "vi",
     final: bool = False,
 ) -> str:
-    if len(pcm_bytes) < sample_rate:  # < ~0.5s of int16 mono
+    if len(pcm_bytes) < int(sample_rate * 0.7):  # < ~0.35s of int16 mono
         return ""
 
     audio = pcm16_to_float32(pcm_bytes)

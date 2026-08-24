@@ -93,7 +93,7 @@ class FaceMouthTracker:
         """Call on every mic chunk so talking = lips + voice, not just a still grin."""
         t = time.time() if now is None else now
         self._last_audio_at = t
-        if peak >= 0.035:
+        if peak >= 0.02:
             self._last_loud_at = t
 
     def note_pcm16(self, pcm: bytes, now: Optional[float] = None) -> None:
@@ -173,12 +173,9 @@ class FaceMouthTracker:
         lip_active = self._visual_talking(activity, flow)
 
         now = time.time()
-        audio_known = (now - self._last_audio_at) < 1.2
-        audio_voice = (now - self._last_loud_at) < 0.45
-        if audio_known:
-            speaking = lip_active and audio_voice
-        else:
-            speaking = lip_active
+        audio_voice = (now - self._last_loud_at) < 0.55
+        # Fast path: mic energy so ASR starts immediately (TalkNet lags ~0.6–1s).
+        speaking = audio_voice
         asd_score = 0.0
         try:
             from app.asd import get_talknet, talknet_ready
@@ -187,9 +184,14 @@ class FaceMouthTracker:
                 net = get_talknet()
                 net.push_face(face_bgr)
                 asd_score = net.maybe_update(now)
-                speaking = bool(net.speaking)
+                if net.speaking or asd_score > -0.35:
+                    speaking = True
+                elif getattr(net, "has_score", False) and asd_score < -0.9 and not audio_voice:
+                    speaking = False
         except Exception:
             pass
+        if not audio_voice and not speaking:
+            speaking = False
 
         return FaceCue(
             found=True,
@@ -259,13 +261,13 @@ class FaceMouthTracker:
         if len(self._hp_hist) > 18:
             self._hp_hist.pop(0)
         hist = np.asarray(self._hp_hist, dtype=np.float32)
-        if hist.size < 8:
+        if hist.size < 4:
             return False
         zc = _zero_crossings(hist[-14:])
         std = float(np.std(hist[-14:]))
         # Talking: periodic open/close (std + zero-crossings). Still face: tiny std.
         # Flow helps when blendshapes are weak but lips actually move.
-        raw = (std >= 0.028 and zc >= 4) or (flow >= 0.55 and std >= 0.016 and zc >= 3)
+        raw = (std >= 0.018 and zc >= 2) or (flow >= 0.35 and std >= 0.012)
         if raw:
             self._hold = 3
             return True

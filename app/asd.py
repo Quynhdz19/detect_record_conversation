@@ -35,10 +35,10 @@ WEIGHT_URL = (
 VIS_FPS = 25
 MFCC_FPS = 100
 SAMPLE_RATE = 16000
-WINDOW_SEC = 1.2
-MIN_SEC = 1.0
-SCORE_EVERY = 0.28
-SPEAK_THRESH = 0.0  # official Columbia eval: score > 0
+WINDOW_SEC = 0.8
+MIN_SEC = 0.64
+SCORE_EVERY = 0.15
+SPEAK_THRESH = -0.35  # more sensitive than paper's 0.0
 
 
 def pick_asd_device() -> str:
@@ -104,6 +104,7 @@ class TalkNetASD:
         self._last_infer = 0.0
         self._infer_busy = False
         self.last_score = 0.0
+        self.has_score = False
         self.speaking = False
         self._hold = 0
         self.ready = True
@@ -130,7 +131,7 @@ class TalkNetASD:
                 return self.last_score
             n_face = len(self._faces)
             pcm_sec = len(self._pcm) / (SAMPLE_RATE * 2)
-            if n_face < 10 or pcm_sec < MIN_SEC:
+            if n_face < 8 or pcm_sec < MIN_SEC:
                 return self.last_score
             faces = list(self._faces)
             pcm = bytes(self._pcm)
@@ -144,8 +145,9 @@ class TalkNetASD:
             score = float(self._infer(faces, pcm))
             with self._lock:
                 self.last_score = score
+                self.has_score = True
                 if score > SPEAK_THRESH:
-                    self._hold = 4
+                    self._hold = 6
                     self.speaking = True
                 elif self._hold > 0:
                     self._hold -= 1
@@ -167,8 +169,8 @@ class TalkNetASD:
             audio, samplerate=SAMPLE_RATE, numcep=13, winlen=0.025, winstep=0.010
         )
         t_audio = mfcc.shape[0] // 4
-        need = min(int(WINDOW_SEC * VIS_FPS), t_audio, max(int(MIN_SEC * VIS_FPS), 25))
-        if need < 25 or mfcc.shape[0] < need * 4:
+        need = min(int(WINDOW_SEC * VIS_FPS), t_audio, max(int(MIN_SEC * VIS_FPS), 16))
+        if need < 16 or mfcc.shape[0] < need * 4:
             return self.last_score
 
         # Repeat/interpolate our ~12 fps crops up to 25 fps
@@ -186,8 +188,8 @@ class TalkNetASD:
             scores = self.bundle.lossAV(out)
         # Use the last ~0.3s of scores (more responsive)
         arr = np.asarray(scores).reshape(-1)
-        tail = arr[-8:] if arr.size else arr
-        return float(np.mean(tail)) if tail.size else 0.0
+        tail = arr[-4:] if arr.size else arr
+        return float(np.max(tail)) if tail.size else 0.0
 
 
 _asd: TalkNetASD | None = None

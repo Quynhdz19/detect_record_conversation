@@ -197,7 +197,7 @@ async def ws_session(websocket: WebSocket):
     )
 
     async def process_chunk(final: bool = False) -> None:
-        if live.busy or live.buf_sec() < 0.7:
+        if live.busy or live.buf_sec() < 0.55:
             return
         if not BOOT["asr_ready"]:
             await websocket.send_json({"type": "status", "text": "ASR chưa sẵn sàng…"})
@@ -294,7 +294,7 @@ async def ws_session(websocket: WebSocket):
                     if live.had_speech:
                         await maybe_decode()
                     else:
-                        live.discard()
+                        live.trim_to(0.55)
                 else:
                     await maybe_decode()
                 continue
@@ -304,10 +304,10 @@ async def ws_session(websocket: WebSocket):
 
             get_tracker().note_pcm16(payload, time.time())
             if require_speaking and last_face.get("found") and not last_face.get("speaking"):
+                live.push_audio(payload, time.time())
+                live.trim_to(0.55)
                 if live.had_speech:
                     await maybe_decode()
-                else:
-                    live.discard()
                 continue
 
             live.push_audio(payload, time.time())

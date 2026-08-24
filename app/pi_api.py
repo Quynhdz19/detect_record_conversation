@@ -248,7 +248,7 @@ async def pi_ws(
 
     async def process_chunk(final: bool = False) -> None:
         nonlocal sess
-        if live.busy or live.buf_sec() < 0.7:
+        if live.busy or live.buf_sec() < 0.55:
             return
         chunk, crops = live.snapshot()
         live.busy = True
@@ -359,7 +359,7 @@ async def pi_ws(
                     if live.had_speech:
                         await maybe_decode()
                     else:
-                        live.discard()
+                        live.trim_to(0.55)
                 else:
                     await maybe_decode()
                 continue
@@ -367,10 +367,10 @@ async def pi_ws(
                 continue
             get_tracker().note_pcm16(payload, time.time())
             if require_speaking and last_face.get("found") and not last_face.get("speaking"):
+                live.push_audio(payload, time.time())
+                live.trim_to(0.55)
                 if live.had_speech:
                     await maybe_decode()
-                else:
-                    live.discard()
                 continue
             live.push_audio(payload, time.time())
             await maybe_decode()

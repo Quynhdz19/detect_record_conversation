@@ -11,11 +11,11 @@ from app.asr import looks_like_speech, pcm16_to_float32
 from app.av_tse import SAMPLE_RATE
 from app.pipeline import run_av_asr
 
-MIN_PARTIAL_SEC = 1.0
-HOP_SEC = 0.55
+MIN_PARTIAL_SEC = 0.65
+HOP_SEC = 0.32
 MAX_UTTER_SEC = 6.0
 MAX_KEEP_SEC = 8.0
-SILENCE_FINAL_SEC = 0.65
+SILENCE_FINAL_SEC = 0.4
 
 
 @dataclass
@@ -34,7 +34,7 @@ class LiveStream:
 
     def push_audio(self, pcm: bytes, now: float) -> None:
         audio = pcm16_to_float32(pcm)
-        if audio.size == 0 or float(np.max(np.abs(audio))) < 0.025:
+        if audio.size == 0 or float(np.max(np.abs(audio))) < 0.012:
             return
         self.buf.extend(pcm)
         self.last_audio_at = now
@@ -62,6 +62,13 @@ class LiveStream:
     def discard(self) -> None:
         """Drop buffered noise without emitting text."""
         self.commit()
+
+    def trim_to(self, seconds: float) -> None:
+        keep = int(self.sr * seconds) * 2
+        if len(self.buf) > keep:
+            self.buf[:] = self.buf[-keep:]
+        if len(self.crops) > 12:
+            self.crops = self.crops[-12:]
 
     def want_partial(self, now: float) -> bool:
         return (
