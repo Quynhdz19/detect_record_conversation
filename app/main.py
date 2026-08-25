@@ -19,8 +19,6 @@ from app.asr import (
     MODEL_ID,
     clean_transcript,
     get_transcriber,
-    looks_like_speech,
-    pcm16_to_float32,
     pick_device,
 )
 from app.av_tse import SAMPLE_RATE, get_av_tse
@@ -192,12 +190,12 @@ async def ws_session(websocket: WebSocket):
             "device": pick_device()[0],
             "sample_rate": sample_rate,
             "av_tse_ready": BOOT["av_tse_ready"],
-            "mode": "live",
+            "mode": "file",
         }
     )
 
     async def process_chunk(final: bool = False) -> None:
-        if live.busy or live.buf_sec() < 0.55:
+        if live.busy or live.buf_sec() < 1.2:
             return
         if not BOOT["asr_ready"]:
             await websocket.send_json({"type": "status", "text": "ASR chưa sẵn sàng…"})
@@ -206,24 +204,13 @@ async def ws_session(websocket: WebSocket):
         live.busy = True
         live.last_decode_at = time.time()
         try:
-            use_tse = final and bool(BOOT.get("av_tse_ready"))
-            if not looks_like_speech(pcm16_to_float32(chunk), sample_rate):
-                if final:
-                    live.discard()
-                    await websocket.send_json({"type": "status", "text": "Im lặng — bỏ qua"})
-                elif live.buf_sec() > 2.0:
-                    keep = int(sample_rate * 0.4) * 2
-                    live.buf[:] = live.buf[-keep:]
-                return
-            live.had_speech = True
             await websocket.send_json(
-                {"type": "status", "text": "Đang nhận chữ…" if not final else "AV-TSE đang tách giọng…"}
+                {"type": "status", "text": "AV-TSE + ASR (cùng luồng file)…"}
             )
-            text, used_tse = await loop.run_in_executor(
-                None, infer_window, chunk, crops, use_tse, final
-            )
-            text = clean_transcript(text, final=final)
+            text, used_tse = await loop.run_in_executor(None, infer_window, chunk, crops)
+            text = clean_transcript(text, final=True)
             if text and (final or text.lower() != live.last_text.lower()):
+                live.had_speech = True
                 live.last_text = text
                 await websocket.send_json(
                     {
@@ -287,29 +274,15 @@ async def ws_session(websocket: WebSocket):
                     "cx": cue.cx,
                     "cy": cue.cy,
                 }
-                if cue.found and cue.face_bgr is not None:
-                    live.push_crop(cue.face_bgr)
+                live.push_crop(cue.face_bgr if cue.found else None)
                 await websocket.send_json({"type": "face", **last_face})
-                if require_speaking and last_face.get("found") and not last_face.get("speaking"):
-                    if live.had_speech:
-                        await maybe_decode()
-                    else:
-                        live.trim_to(0.55)
-                else:
-                    await maybe_decode()
+                await maybe_decode()
                 continue
 
             if tag != 2:
                 continue
 
             get_tracker().note_pcm16(payload, time.time())
-            if require_speaking and last_face.get("found") and not last_face.get("speaking"):
-                live.push_audio(payload, time.time())
-                live.trim_to(0.55)
-                if live.had_speech:
-                    await maybe_decode()
-                continue
-
             live.push_audio(payload, time.time())
             await maybe_decode()
 

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Detect Giọng Nói — AV-TSE Demo</title>
-    <link rel="stylesheet" href="/static/style.css?v=10" />
+    <link rel="stylesheet" href="/static/style.css?v=11" />
   </head>
   <body>
     <div class="bg"></div>
@@ -67,7 +67,7 @@
           </div>
 
           <ul class="tips">
-            <li>Live: chữ hiện khi đang nói (~1s), chốt câu khi ngừng</li>
+            <li>Live dùng cùng pipeline file: AV-TSE + PhoWhisper (~2s/lần)</li>
             <li>AV-TSE: <code>AV_MossFormer2_TSE_16K</code></li>
             <li>ASR: <code>vinai/PhoWhisper-small</code></li>
           </ul>
@@ -128,6 +128,6 @@
         tick();
       })();
     </script>
-    <script src="/static/app.js?v=10"></script>
+    <script src="/static/app.js?v=11"></script>
   </body>
 </html>

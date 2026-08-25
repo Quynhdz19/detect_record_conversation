@@ -12,8 +12,8 @@ import cv2
 import numpy as np
 import soundfile as sf
 
-from app.asr import transcribe_pcm16
 from app.av_tse import SAMPLE_RATE, get_av_tse
+from app.pipeline import run_file_asr
 from app.vision import get_tracker
 
 logger = logging.getLogger(__name__)
@@ -105,21 +105,10 @@ def process_mp4(video_bytes: bytes, filename: str = "input.mp4") -> dict:
         raise RuntimeError(f"Unexpected sample rate {sr}")
 
     crops = collect_face_crops(video_path)
-    used_tse = False
-    if crops:
-        try:
-            extracted = get_av_tse().extract(audio, crops)
-            audio = extracted
-            used_tse = True
-        except Exception:
-            logger.exception("AV-TSE on video failed; using original audio")
-    else:
+    if not crops:
         logger.warning("No face crops found; ASR on raw audio")
-
-    audio = np.clip(audio.astype(np.float32), -1.0, 1.0)
-    sf.write(str(out_wav), audio, SAMPLE_RATE)
-    pcm = (audio * 32767.0).astype(np.int16).tobytes()
-    text = transcribe_pcm16(pcm, sample_rate=SAMPLE_RATE)
+    text, used_tse, audio_out = run_file_asr(audio, crops)
+    sf.write(str(out_wav), audio_out, SAMPLE_RATE)
 
     return {
         "job_id": job_id,
