@@ -99,8 +99,11 @@ _GREETING_OK_ON_FINAL = {
 _HALLUCINATION_SUBSTR = (
     "hãy subscribe",
     "đăng ký kênh",
+    "hãy đăng ký",
     "phụ đề được thực hiện",
     "phụ đề được thực hiện bởi",
+    "cảm ơn bạn đã",
+    "cảm ơn các bạn đã",
     "thanks for watching",
     "please subscribe",
     "vietsub",
@@ -130,7 +133,9 @@ def looks_like_speech(audio: np.ndarray, sample_rate: int = 16000) -> bool:
     return s["peak"] >= 0.032 and s["rms"] >= 0.005 and s["voiced_ratio"] >= 0.08
 
 
-def clean_transcript(text: str, *, final: bool = False) -> str:
+def clean_transcript(
+    text: str, *, final: bool = False, allow_greetings: bool | None = None
+) -> str:
     raw = (text or "").strip()
     if not raw:
         return ""
@@ -144,7 +149,10 @@ def clean_transcript(text: str, *, final: bool = False) -> str:
     if len(parts) >= 3 and len(set(parts)) == 1:
         return ""
     if lower in _HALLUCINATION_EXACT:
-        if final and lower in _GREETING_OK_ON_FINAL:
+        # "xin chào" / "cảm ơn" are also Whisper's default silence hallucinations.
+        # Only keep them when the caller saw real speech in this window.
+        keep_greeting = allow_greetings if allow_greetings is not None else final
+        if keep_greeting and lower in _GREETING_OK_ON_FINAL:
             return collapsed
         return ""
     return collapsed
@@ -155,6 +163,7 @@ def transcribe_pcm16(
     sample_rate: int = 16000,
     language: Optional[str] = "vi",
     final: bool = False,
+    allow_greetings: bool | None = None,
 ) -> str:
     if len(pcm_bytes) < int(sample_rate * 0.7):  # < ~0.35s of int16 mono
         return ""
@@ -177,4 +186,8 @@ def transcribe_pcm16(
         generate_kwargs=generate_kwargs,
         return_timestamps=False,
     )
-    return clean_transcript(result.get("text") or "", final=final)
+    return clean_transcript(
+        result.get("text") or "",
+        final=final,
+        allow_greetings=allow_greetings,
+    )

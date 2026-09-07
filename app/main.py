@@ -22,7 +22,7 @@ from app.asr import (
     pick_device,
 )
 from app.av_tse import SAMPLE_RATE, get_av_tse
-from app.live import LiveStream, infer_window
+from app.live import LiveStream, audio_is_voiced, infer_window, speaking_blocked
 from app.pi_api import router as pi_router
 from app.video_pipeline import TMP_ROOT, process_mp4
 from app.vision import get_tracker
@@ -190,9 +190,14 @@ async def ws_session(websocket: WebSocket):
             "device": pick_device()[0],
             "sample_rate": sample_rate,
             "av_tse_ready": BOOT["av_tse_ready"],
-            "mode": "file",
+            "mode": "live",
         }
     )
+
+    async def emit_silence() -> None:
+        now = time.time()
+        if live.should_emit_silence(now):
+            await websocket.send_json({"type": "status", "text": "silence"})
 
     async def process_chunk(final: bool = False) -> None:
         if live.busy or live.buf_sec() < 1.2:
@@ -200,15 +205,22 @@ async def ws_session(websocket: WebSocket):
         if not BOOT["asr_ready"]:
             await websocket.send_json({"type": "status", "text": "ASR chưa sẵn sàng…"})
             return
+        if live.last_voice_at <= 0:
+            live.trim_to(0.45)
+            await emit_silence()
+            return
         chunk, crops = live.snapshot()
         live.busy = True
         live.last_decode_at = time.time()
+        allow_greetings = final and live.last_voice_at > 0
         try:
             await websocket.send_json(
-                {"type": "status", "text": "AV-TSE + ASR (cùng luồng file)…"}
+                {"type": "status", "text": "AV-TSE + ASR…"}
             )
-            text, used_tse = await loop.run_in_executor(None, infer_window, chunk, crops)
-            text = clean_transcript(text, final=True)
+            text, used_tse = await loop.run_in_executor(
+                None, infer_window, chunk, crops, True, final, allow_greetings
+            )
+            text = clean_transcript(text, final=final, allow_greetings=allow_greetings)
             if text and (final or text.lower() != live.last_text.lower()):
                 live.had_speech = True
                 live.last_text = text
@@ -223,14 +235,24 @@ async def ws_session(websocket: WebSocket):
                 )
             if final:
                 live.commit()
-            await websocket.send_json({"type": "status", "text": "Đang nghe…"})
+            if text:
+                await websocket.send_json({"type": "status", "text": "Đang nghe…"})
+            else:
+                await emit_silence()
         finally:
             live.busy = False
 
     async def maybe_decode() -> None:
         now = time.time()
+        if live.idle_silence():
+            live.trim_to(0.45)
+            await emit_silence()
+            return
+        blocked = speaking_blocked(require_speaking, last_face)
         if live.want_len_final() or live.want_silence_final(now):
             await process_chunk(final=True)
+        elif blocked:
+            return
         elif live.want_partial(now):
             await process_chunk(final=False)
 
@@ -244,7 +266,7 @@ async def ws_session(websocket: WebSocket):
                 data = json.loads(message["text"])
                 msg_type = data.get("type")
                 if msg_type == "config":
-                    require_speaking = bool(data.get("require_speaking", False))
+                    require_speaking = bool(data.get("require_speaking", True))
                     await websocket.send_json(
                         {"type": "config_ok", "require_speaking": require_speaking}
                     )
@@ -282,8 +304,15 @@ async def ws_session(websocket: WebSocket):
             if tag != 2:
                 continue
 
-            get_tracker().note_pcm16(payload, time.time())
-            live.push_audio(payload, time.time())
+            now = time.time()
+            get_tracker().note_pcm16(payload, now)
+            voiced = audio_is_voiced(
+                payload,
+                speaking=bool(last_face.get("speaking")),
+                require_speaking=require_speaking,
+                face_found=bool(last_face.get("found")),
+            )
+            live.push_audio(payload, now, voiced=voiced)
             await maybe_decode()
 
     except WebSocketDisconnect:

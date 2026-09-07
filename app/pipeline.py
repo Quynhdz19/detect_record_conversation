@@ -18,7 +18,11 @@ def _to_pcm16(audio: np.ndarray) -> bytes:
 
 
 def run_av_asr(
-    pcm_bytes: bytes, face_crops: list, use_tse: bool = True, final: bool = False
+    pcm_bytes: bytes,
+    face_crops: list,
+    use_tse: bool = True,
+    final: bool = False,
+    allow_greetings: bool | None = None,
 ) -> tuple[str, bool]:
     """Extract target voice (optional) then transcribe. Returns (text, used_tse)."""
     raw = pcm16_to_float32(pcm_bytes)
@@ -42,10 +46,20 @@ def run_av_asr(
         except Exception:
             logger.exception("AV-TSE failed; using raw mic")
 
-    text = transcribe_pcm16(_to_pcm16(audio), sample_rate=SAMPLE_RATE, final=final)
+    text = transcribe_pcm16(
+        _to_pcm16(audio),
+        sample_rate=SAMPLE_RATE,
+        final=final,
+        allow_greetings=allow_greetings,
+    )
     if not text and used_tse:
         logger.info("ASR empty after TSE; retry raw mic")
-        text = transcribe_pcm16(_to_pcm16(raw), sample_rate=SAMPLE_RATE, final=final)
+        text = transcribe_pcm16(
+            _to_pcm16(raw),
+            sample_rate=SAMPLE_RATE,
+            final=final,
+            allow_greetings=allow_greetings,
+        )
         used_tse = False
     if not text:
         logger.info("ASR empty after speech-like audio stats=%s", speech_stats(raw, SAMPLE_RATE))
@@ -53,7 +67,7 @@ def run_av_asr(
 
 
 def run_file_asr(audio_f32: np.ndarray, face_crops: list) -> tuple[str, bool, np.ndarray]:
-    """Same path as MP4 upload: AV-TSE then PhoWhisper. No TalkNet / live VAD gate."""
+    """MP4 / one-shot clip: AV-TSE then PhoWhisper. Still skip obvious silence."""
     audio = np.clip(np.asarray(audio_f32, dtype=np.float32).reshape(-1), -1.0, 1.0)
     if audio.size < SAMPLE_RATE // 4:
         return "", False, audio
@@ -61,12 +75,29 @@ def run_file_asr(audio_f32: np.ndarray, face_crops: list) -> tuple[str, bool, np
     if face_crops:
         try:
             extracted = get_av_tse().extract(audio, face_crops)
-            audio = np.clip(np.asarray(extracted, dtype=np.float32).reshape(-1), -1.0, 1.0)
-            used_tse = True
+            extracted = np.clip(np.asarray(extracted, dtype=np.float32).reshape(-1), -1.0, 1.0)
+            if looks_like_speech(extracted, SAMPLE_RATE):
+                audio = extracted
+                used_tse = True
+            elif not looks_like_speech(audio, SAMPLE_RATE):
+                logger.info(
+                    "skip file ASR: not speech raw=%s tse=%s",
+                    speech_stats(audio, SAMPLE_RATE),
+                    speech_stats(extracted, SAMPLE_RATE),
+                )
+                return "", False, audio
+            else:
+                logger.info(
+                    "AV-TSE output failed VAD %s; using raw audio",
+                    speech_stats(extracted, SAMPLE_RATE),
+                )
         except Exception:
             logger.exception("AV-TSE failed; using raw audio")
+    elif not looks_like_speech(audio, SAMPLE_RATE):
+        logger.info("skip file ASR: raw not speech %s", speech_stats(audio, SAMPLE_RATE))
+        return "", False, audio
     pcm = (audio * 32767.0).astype(np.int16).tobytes()
-    text = transcribe_pcm16(pcm, sample_rate=SAMPLE_RATE, final=True)
+    text = transcribe_pcm16(pcm, sample_rate=SAMPLE_RATE, final=True, allow_greetings=True)
     return text, used_tse, audio
 
 

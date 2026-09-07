@@ -27,7 +27,7 @@ from fastapi import (
 from app.asr import MODEL_ID, clean_transcript, pick_device
 from app.av_tse import SAMPLE_RATE
 from app.conversation import append_turn, create_session, get_session
-from app.live import LiveStream, infer_window
+from app.live import LiveStream, audio_is_voiced, infer_window, speaking_blocked
 from app.pipeline import run_file_asr_pcm
 from app.vision import get_tracker
 
@@ -162,7 +162,7 @@ async def pi_utterance(
         crops = await loop.run_in_executor(None, _crops_from_jpegs, jpegs)
 
     text, used_tse = await loop.run_in_executor(None, run_file_asr_pcm, pcm, crops)
-    text = clean_transcript(text)
+    text = clean_transcript(text, final=True, allow_greetings=True)
     sess = append_turn(session_id, text, used_tse=used_tse) if text else get_session(session_id)
     return {
         "ok": True,
@@ -233,7 +233,7 @@ async def pi_ws(
             "asr_model": MODEL_ID,
             "device": pick_device()[0],
             "protocol": "websocket",
-            "mode": "file",
+            "mode": "live",
         }
     )
     last_ping = time.time()
@@ -244,19 +244,32 @@ async def pi_ws(
             return base
         return f"{base}\n{partial}".strip() if base else partial
 
+    async def emit_silence() -> None:
+        now = time.time()
+        if live.should_emit_silence(now):
+            await websocket.send_json({"type": "status", "text": "silence"})
+
     async def process_chunk(final: bool = False) -> None:
         nonlocal sess
         if live.busy or live.buf_sec() < 1.2:
             return
+        if live.last_voice_at <= 0:
+            live.trim_to(0.45)
+            await emit_silence()
+            return
         chunk, crops = live.snapshot()
         live.busy = True
         live.last_decode_at = time.time()
+        allow_greetings = final and live.last_voice_at > 0
         try:
-            text, used_tse = await loop.run_in_executor(None, infer_window, chunk, crops)
-            text = clean_transcript(text, final=True)
+            text, used_tse = await loop.run_in_executor(
+                None, infer_window, chunk, crops, True, final, allow_greetings
+            )
+            text = clean_transcript(text, final=final, allow_greetings=allow_greetings)
             if not text:
                 if final:
                     live.commit()
+                    await emit_silence()
                 return
             if not final and text.lower() == live.last_text.lower():
                 return
@@ -285,8 +298,15 @@ async def pi_ws(
 
     async def maybe_decode() -> None:
         now = time.time()
+        if live.idle_silence():
+            live.trim_to(0.45)
+            await emit_silence()
+            return
+        blocked = speaking_blocked(require_speaking, last_face)
         if live.want_len_final() or live.want_silence_final(now):
             await process_chunk(final=True)
+        elif blocked:
+            return
         elif live.want_partial(now):
             await process_chunk(final=False)
 
@@ -344,8 +364,15 @@ async def pi_ws(
                 continue
             if tag != 2:
                 continue
-            get_tracker().note_pcm16(payload, time.time())
-            live.push_audio(payload, time.time())
+            now = time.time()
+            get_tracker().note_pcm16(payload, now)
+            voiced = audio_is_voiced(
+                payload,
+                speaking=bool(last_face.get("speaking")),
+                require_speaking=require_speaking,
+                face_found=bool(last_face.get("found")),
+            )
+            live.push_audio(payload, now, voiced=voiced)
             await maybe_decode()
     except WebSocketDisconnect:
         logger.info("Pi WS disconnected session=%s", session_id)
