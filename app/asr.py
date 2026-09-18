@@ -104,6 +104,7 @@ _HALLUCINATION_SUBSTR = (
     "phụ đề được thực hiện bởi",
     "cảm ơn bạn đã",
     "cảm ơn các bạn đã",
+    "nhiều doanh nghiệp",
     "thanks for watching",
     "please subscribe",
     "vietsub",
@@ -128,9 +129,46 @@ def speech_stats(audio: np.ndarray, sample_rate: int = 16000) -> dict:
 
 
 def looks_like_speech(audio: np.ndarray, sample_rate: int = 16000) -> bool:
-    """Reject silence / faint room noise before calling ASR."""
+    """Reject hush / noise floor; keep conversational speech (AGC off).
+
+    Measured quiet room: rms ~0.005–0.007, voiced_ratio ~0.00–0.03.
+    """
     s = speech_stats(audio, sample_rate)
-    return s["peak"] >= 0.032 and s["rms"] >= 0.005 and s["voiced_ratio"] >= 0.08
+    return s["peak"] >= 0.048 and s["rms"] >= 0.008 and s["voiced_ratio"] >= 0.045
+
+
+def _text_too_long_for_noise(text: str, stats: dict) -> bool:
+    """Drop news-like Whisper inventions on near-silence only."""
+    n_words = len((text or "").split())
+    if n_words < 6:
+        return False
+    return stats.get("rms", 1.0) < 0.009 and stats.get("voiced_ratio", 1.0) < 0.08
+
+
+def _no_speech_prob(asr, audio: np.ndarray, sample_rate: int) -> float:
+    """First-decoder-step P(<|nospeech|>). High ⇒ Whisper thinks the clip is silence."""
+    try:
+        model = asr.model
+        fe = asr.feature_extractor
+        tok = asr.tokenizer
+        gen = model.generation_config
+        no_speech_id = getattr(gen, "no_speech_token_id", None)
+        if no_speech_id is None:
+            no_speech_id = tok.convert_tokens_to_ids("<|nospeech|>")
+        if no_speech_id is None or int(no_speech_id) < 0:
+            return 0.0
+        param = next(model.parameters())
+        feats = fe(audio, sampling_rate=sample_rate, return_tensors="pt")
+        input_features = feats.input_features.to(device=param.device, dtype=param.dtype)
+        start_id = gen.decoder_start_token_id or model.config.decoder_start_token_id
+        decoder_input_ids = torch.tensor([[start_id]], device=param.device)
+        with torch.inference_mode():
+            out = model(input_features=input_features, decoder_input_ids=decoder_input_ids)
+            prob = torch.softmax(out.logits[0, -1].float(), dim=-1)[int(no_speech_id)]
+        return float(prob)
+    except Exception:
+        logger.debug("no_speech_prob failed", exc_info=True)
+        return 0.0
 
 
 def clean_transcript(
@@ -169,10 +207,17 @@ def transcribe_pcm16(
         return ""
 
     audio = pcm16_to_float32(pcm_bytes)
+    stats = speech_stats(audio, sample_rate)
     if not looks_like_speech(audio, sample_rate):
+        logger.info("skip ASR: not speech %s", stats)
         return ""
 
     asr = get_transcriber()
+    nsp = _no_speech_prob(asr, audio, sample_rate)
+    if nsp >= 0.7 and stats["rms"] < 0.01 and stats["voiced_ratio"] < 0.08:
+        logger.info("skip ASR: no_speech_prob=%.2f stats=%s", nsp, stats)
+        return ""
+
     generate_kwargs = {
         "task": "transcribe",
         "temperature": 0.0,
@@ -186,8 +231,13 @@ def transcribe_pcm16(
         generate_kwargs=generate_kwargs,
         return_timestamps=False,
     )
-    return clean_transcript(
-        result.get("text") or "",
-        final=final,
-        allow_greetings=allow_greetings,
-    )
+    raw_text = result.get("text") or ""
+    if _text_too_long_for_noise(raw_text, stats):
+        logger.info("drop hallucination %r stats=%s nsp=%.2f", raw_text, stats, nsp)
+        return ""
+    text = clean_transcript(raw_text, final=final, allow_greetings=allow_greetings)
+    if text:
+        logger.info("ASR ok %r stats=%s nsp=%.2f", text, stats, nsp)
+    else:
+        logger.info("ASR cleaned empty from %r stats=%s", raw_text, stats)
+    return text

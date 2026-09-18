@@ -85,6 +85,7 @@ class FaceMouthTracker:
         self._prev_cheek: Optional[np.ndarray] = None
         self._last_loud_at = 0.0
         self._last_audio_at = 0.0
+        self._speak_hold = 0
 
     def close(self) -> None:
         self._landmarker.close()
@@ -93,7 +94,7 @@ class FaceMouthTracker:
         """Call on every mic chunk so talking = lips + voice, not just a still grin."""
         t = time.time() if now is None else now
         self._last_audio_at = t
-        if peak >= 0.02:
+        if peak >= 0.035:
             self._last_loud_at = t
 
     def note_pcm16(self, pcm: bytes, now: Optional[float] = None) -> None:
@@ -174,8 +175,6 @@ class FaceMouthTracker:
 
         now = time.time()
         audio_voice = (now - self._last_loud_at) < 0.55
-        # Fast path: mic energy so ASR starts immediately (TalkNet lags ~0.6–1s).
-        speaking = audio_voice
         asd_score = 0.0
         try:
             from app.asd import get_talknet, talknet_ready
@@ -184,14 +183,15 @@ class FaceMouthTracker:
                 net = get_talknet()
                 net.push_face(face_bgr)
                 asd_score = net.maybe_update(now)
-                if net.speaking or asd_score > -0.35:
-                    speaking = True
-                elif getattr(net, "has_score", False) and asd_score < -0.9 and not audio_voice:
-                    speaking = False
         except Exception:
             pass
-        if not audio_voice and not speaking:
-            speaking = False
+        # Open/moving mouth + mic energy. Hold through short gaps ("một... hai").
+        mouth_talking = bool(lip_active) or mouth_open >= 0.12
+        if mouth_talking and audio_voice:
+            self._speak_hold = 12
+        elif self._speak_hold > 0:
+            self._speak_hold -= 1
+        speaking = audio_voice and (mouth_talking or self._speak_hold > 0)
 
         return FaceCue(
             found=True,
@@ -211,6 +211,8 @@ class FaceMouthTracker:
     def _reset_motion(self) -> None:
         self._hp_hist.clear()
         self._hold = 0
+        self._act_ema = 0.0
+        self._speak_hold = 0
         self._prev_mouth = None
         self._prev_cheek = None
 
@@ -265,11 +267,10 @@ class FaceMouthTracker:
             return False
         zc = _zero_crossings(hist[-14:])
         std = float(np.std(hist[-14:]))
-        # Talking: periodic open/close (std + zero-crossings). Still face: tiny std.
-        # Flow helps when blendshapes are weak but lips actually move.
-        raw = (std >= 0.018 and zc >= 2) or (flow >= 0.35 and std >= 0.012)
+        # Talking: periodic open/close. Still face / webcam jitter stays below this.
+        raw = (std >= 0.02 and zc >= 2) or (flow >= 0.4 and std >= 0.014)
         if raw:
-            self._hold = 3
+            self._hold = 5
             return True
         if self._hold > 0:
             self._hold -= 1
@@ -282,7 +283,7 @@ _tracker: Optional[FaceMouthTracker] = None
 
 def get_tracker() -> FaceMouthTracker:
     global _tracker
-    if _tracker is None or not hasattr(_tracker, "note_audio"):
+    if _tracker is None or not hasattr(_tracker, "_speak_hold"):
         if _tracker is not None:
             try:
                 _tracker.close()

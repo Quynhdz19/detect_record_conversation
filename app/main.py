@@ -199,31 +199,35 @@ async def ws_session(websocket: WebSocket):
         if live.should_emit_silence(now):
             await websocket.send_json({"type": "status", "text": "silence"})
 
-    async def process_chunk(final: bool = False) -> None:
-        if live.busy or live.buf_sec() < 1.2:
+    def kick_decode(final: bool) -> None:
+        # Never await ASR on the receive path — mic chunks must keep landing in the buffer.
+        if live.busy or live.buf_sec() < 1.2 or live.last_voice_at <= 0:
             return
-        if not BOOT["asr_ready"]:
-            await websocket.send_json({"type": "status", "text": "ASR chưa sẵn sàng…"})
-            return
-        if live.last_voice_at <= 0:
-            live.trim_to(0.45)
-            await emit_silence()
-            return
-        chunk, crops = live.snapshot()
         live.busy = True
         live.last_decode_at = time.time()
-        allow_greetings = final and live.last_voice_at > 0
+        asyncio.create_task(process_chunk(final))
+
+    async def process_chunk(final: bool = False) -> None:
         try:
-            await websocket.send_json(
-                {"type": "status", "text": "AV-TSE + ASR…"}
-            )
+            if not BOOT["asr_ready"]:
+                await websocket.send_json({"type": "status", "text": "ASR chưa sẵn sàng…"})
+                return
+            await websocket.send_json({"type": "status", "text": "AV-TSE + ASR…"})
+            chunk, crops = live.snapshot()
+            allow_greetings = final and live.last_voice_at > 0
             text, used_tse = await loop.run_in_executor(
                 None, infer_window, chunk, crops, True, final, allow_greetings
             )
             text = clean_transcript(text, final=final, allow_greetings=allow_greetings)
-            if text and (final or text.lower() != live.last_text.lower()):
+            if text:
                 live.had_speech = True
                 live.last_text = text
+                logger.info(
+                    "send transcript final=%s buf=%.2fs %r",
+                    final,
+                    live.buf_sec(),
+                    text,
+                )
                 await websocket.send_json(
                     {
                         "type": "transcript",
@@ -233,28 +237,35 @@ async def ws_session(websocket: WebSocket):
                         "face": last_face,
                     }
                 )
+            else:
+                logger.info("live ASR empty final=%s buf=%.2fs", final, live.buf_sec())
             if final:
                 live.commit()
             if text:
                 await websocket.send_json({"type": "status", "text": "Đang nghe…"})
             else:
                 await emit_silence()
+        except Exception:
+            logger.exception("live decode failed")
         finally:
             live.busy = False
 
     async def maybe_decode() -> None:
         now = time.time()
+        if not last_face.get("found"):
+            await emit_silence()
+            return
         if live.idle_silence():
             live.trim_to(0.45)
             await emit_silence()
             return
         blocked = speaking_blocked(require_speaking, last_face)
         if live.want_len_final() or live.want_silence_final(now):
-            await process_chunk(final=True)
-        elif blocked:
+            kick_decode(True)
+        elif blocked and live.last_voice_at <= 0:
             return
         elif live.want_partial(now):
-            await process_chunk(final=False)
+            kick_decode(False)
 
     try:
         while True:
@@ -271,7 +282,7 @@ async def ws_session(websocket: WebSocket):
                         {"type": "config_ok", "require_speaking": require_speaking}
                     )
                 elif msg_type == "flush":
-                    await process_chunk(final=True)
+                    kick_decode(True)
                 continue
 
             raw = message.get("bytes")
@@ -296,7 +307,7 @@ async def ws_session(websocket: WebSocket):
                     "cx": cue.cx,
                     "cy": cue.cy,
                 }
-                live.push_crop(cue.face_bgr if cue.found else None)
+                live.note_face(cue.face_bgr if cue.found else None, found=bool(cue.found))
                 await websocket.send_json({"type": "face", **last_face})
                 await maybe_decode()
                 continue
@@ -311,6 +322,8 @@ async def ws_session(websocket: WebSocket):
                 speaking=bool(last_face.get("speaking")),
                 require_speaking=require_speaking,
                 face_found=bool(last_face.get("found")),
+                now=now,
+                last_voice_at=live.last_voice_at,
             )
             live.push_audio(payload, now, voiced=voiced)
             await maybe_decode()

@@ -249,19 +249,18 @@ async def pi_ws(
         if live.should_emit_silence(now):
             await websocket.send_json({"type": "status", "text": "silence"})
 
-    async def process_chunk(final: bool = False) -> None:
-        nonlocal sess
-        if live.busy or live.buf_sec() < 1.2:
+    def kick_decode(final: bool) -> None:
+        if live.busy or live.buf_sec() < 1.2 or live.last_voice_at <= 0:
             return
-        if live.last_voice_at <= 0:
-            live.trim_to(0.45)
-            await emit_silence()
-            return
-        chunk, crops = live.snapshot()
         live.busy = True
         live.last_decode_at = time.time()
-        allow_greetings = final and live.last_voice_at > 0
+        asyncio.create_task(process_chunk(final))
+
+    async def process_chunk(final: bool = False) -> None:
+        nonlocal sess
         try:
+            chunk, crops = live.snapshot()
+            allow_greetings = final and live.last_voice_at > 0
             text, used_tse = await loop.run_in_executor(
                 None, infer_window, chunk, crops, True, final, allow_greetings
             )
@@ -274,6 +273,7 @@ async def pi_ws(
             if not final and text.lower() == live.last_text.lower():
                 return
             live.last_text = text
+            logger.info("send transcript final=%s buf=%.2fs %r", final, live.buf_sec(), text)
             if final:
                 sess = append_turn(session_id, text, used_tse=used_tse) or sess
                 conversation = sess.get("conversation", "")
@@ -293,22 +293,27 @@ async def pi_ws(
                     "turns": turns,
                 }
             )
+        except Exception:
+            logger.exception("pi live decode failed")
         finally:
             live.busy = False
 
     async def maybe_decode() -> None:
         now = time.time()
+        if not last_face.get("found"):
+            await emit_silence()
+            return
         if live.idle_silence():
             live.trim_to(0.45)
             await emit_silence()
             return
         blocked = speaking_blocked(require_speaking, last_face)
         if live.want_len_final() or live.want_silence_final(now):
-            await process_chunk(final=True)
-        elif blocked:
+            kick_decode(True)
+        elif blocked and live.last_voice_at <= 0:
             return
         elif live.want_partial(now):
-            await process_chunk(final=False)
+            kick_decode(False)
 
     try:
         while True:
@@ -331,7 +336,7 @@ async def pi_ws(
                         {"type": "config_ok", "require_speaking": require_speaking}
                     )
                 elif kind == "flush":
-                    await process_chunk(final=True)
+                    kick_decode(True)
                 elif kind == "get_conversation":
                     await websocket.send_json(
                         {"type": "conversation", **(get_session(session_id) or {})}
@@ -358,7 +363,7 @@ async def pi_ws(
                     "w": cue.w,
                     "h": cue.h,
                 }
-                live.push_crop(cue.face_bgr if cue.found else None)
+                live.note_face(cue.face_bgr if cue.found else None, found=bool(cue.found))
                 await websocket.send_json({"type": "face", **last_face})
                 await maybe_decode()
                 continue
@@ -371,6 +376,8 @@ async def pi_ws(
                 speaking=bool(last_face.get("speaking")),
                 require_speaking=require_speaking,
                 face_found=bool(last_face.get("found")),
+                now=now,
+                last_voice_at=live.last_voice_at,
             )
             live.push_audio(payload, now, voiced=voiced)
             await maybe_decode()

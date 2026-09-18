@@ -44,16 +44,19 @@
   function pushTranscript(text, final, usedTse) {
     if (!text || !String(text).trim()) return;
     const prefix = usedTse ? "" : "[raw] ";
+    const shown = String(text).trim();
     if (!final && lines.length && lines[lines.length - 1].startsWith("… ")) {
-      lines[lines.length - 1] = "… " + prefix + text;
+      lines[lines.length - 1] = "… " + prefix + shown;
     } else if (!final) {
-      lines.push("… " + prefix + text);
+      lines.push("… " + prefix + shown);
     } else if (lines.length && lines[lines.length - 1].startsWith("… ")) {
-      lines[lines.length - 1] = prefix + text;
+      lines[lines.length - 1] = prefix + shown;
     } else {
-      lines.push(prefix + text);
+      lines.push(prefix + shown);
     }
     transcriptEl.textContent = lines.join("\n");
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    setBanner((final ? "Câu: " : "… ") + "<strong>" + shown.replace(/</g, "") + "</strong>", "ok");
   }
 
   function resizeOverlay() {
@@ -126,6 +129,10 @@
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
       return Promise.resolve();
     }
+    if (ws) {
+      try { ws.close(); } catch (_) {}
+      ws = null;
+    }
     return new Promise((resolve, reject) => {
       const proto = location.protocol === "https:" ? "wss" : "ws";
       ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -144,7 +151,12 @@
       };
 
       ws.onmessage = (ev) => {
-        const msg = JSON.parse(ev.data);
+        let msg;
+        try {
+          msg = JSON.parse(ev.data);
+        } catch (_) {
+          return;
+        }
         if (msg.type === "ready") {
           setMeta(`${msg.av_tse_model} + ${msg.asr_model} · ${msg.device} · live`);
         } else if (msg.type === "face") {
@@ -214,9 +226,9 @@
     const attempts = [
       {
         audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: true,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: false,
           channelCount: 1,
         },
         video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
@@ -339,12 +351,12 @@
   }
 
   async function startListening() {
+    if (listening) return;
     await openMedia();
     if (audioCtx && audioCtx.state === "suspended") await audioCtx.resume();
     setBanner("Đang kết nối WebSocket…");
     await connectWs();
-    lines = [];
-    transcriptEl.textContent = "Đang nghe + AV-TSE…";
+    if (!lines.length) transcriptEl.textContent = "(nói đi, chữ sẽ hiện ở đây)";
     listening = true;
     listenBtn.disabled = true;
     flushBtn.disabled = false;

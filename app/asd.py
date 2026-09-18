@@ -38,7 +38,7 @@ SAMPLE_RATE = 16000
 WINDOW_SEC = 0.8
 MIN_SEC = 0.64
 SCORE_EVERY = 0.15
-SPEAK_THRESH = -0.35  # more sensitive than paper's 0.0
+SPEAK_THRESH = 0.0  # paper default; -0.35 treated nearby talk as this face
 
 
 def pick_asd_device() -> str:

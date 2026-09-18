@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,13 +13,16 @@ from app.pipeline import run_av_asr
 
 # File upload works on a full clip. Live does the same on ~2.5s slices
 # only after there is actual voice, not continuous mic silence.
-MIN_FILE_SEC = 2.2
-HOP_SEC = 1.6
+MIN_FILE_SEC = 1.8
+HOP_SEC = 1.0
 MAX_UTTER_SEC = 8.0
 MAX_KEEP_SEC = 12.0
-SILENCE_FINAL_SEC = 0.7
+SILENCE_FINAL_SEC = 1.4
 PRE_ROLL_SEC = 0.45
-VOICE_PEAK = 0.02
+VOICE_PEAK = 0.035
+MIN_VOICED_SEC = 0.12
+HANGOVER_SEC = 1.6
+COMMIT_OVERLAP_SEC = 1.0
 
 
 @dataclass
@@ -34,6 +38,9 @@ class LiveStream:
     last_silence_at: float = 0.0
     busy: bool = False
     had_speech: bool = False
+    face_miss: int = 0
+    voiced_sec: float = 0.0
+    voiced_run_sec: float = 0.0
 
     def buf_sec(self) -> float:
         return len(self.buf) / (self.sr * 2)
@@ -42,8 +49,16 @@ class LiveStream:
         if not pcm:
             return
         self.last_audio_at = now
+        chunk_sec = len(pcm) / (self.sr * 2)
         if voiced:
+            self.voiced_run_sec = min(2.0, self.voiced_run_sec + chunk_sec)
+        else:
+            self.voiced_run_sec = max(0.0, self.voiced_run_sec - chunk_sec)
+        # Ignore isolated clicks; need a stretch of voice before opening an utterance.
+        commit_voice = voiced and self.voiced_run_sec >= MIN_VOICED_SEC
+        if commit_voice:
             self.last_voice_at = now
+            self.voiced_sec += chunk_sec
             self.buf.extend(pcm)
         elif self.last_voice_at > 0:
             self.buf.extend(pcm)
@@ -54,28 +69,58 @@ class LiveStream:
         if len(self.buf) > max_b:
             del self.buf[: len(self.buf) - max_b]
 
+    def note_face(self, crop: Any, *, found: bool) -> None:
+        """Keep TSE crops only while a face is visible. Lost face → drop leftover audio."""
+        if found:
+            self.face_miss = 0
+            self.push_crop(crop)
+            return
+        self.face_miss += 1
+        self.last_crop = None
+        if self.face_miss >= 6 and not self.busy:
+            self.discard()
+
     def push_crop(self, crop: Any) -> None:
         if crop is not None:
             self.last_crop = crop
             self.crops.append(crop)
-        elif self.last_crop is not None:
-            self.crops.append(self.last_crop)
         if len(self.crops) > 96:
             self.crops = self.crops[-96:]
 
     def snapshot(self) -> tuple[bytes, list[Any]]:
         return bytes(self.buf), list(self.crops)
 
-    def commit(self) -> None:
+    def commit(self, keep_sec: float = COMMIT_OVERLAP_SEC) -> None:
+        """End an utterance but keep a tail so words said during ASR are not wiped."""
+        keep_b = int(self.sr * max(0.0, keep_sec)) * 2
+        tail = bytes(self.buf[-keep_b:]) if keep_b and self.buf else b""
+        tail_crops = list(self.crops[-12:]) if keep_b and self.crops else []
+        last_v = self.last_voice_at
+        last_crop = self.last_crop
         self.buf.clear()
         self.crops.clear()
         self.had_speech = False
         self.last_text = ""
         self.last_audio_at = 0.0
-        self.last_voice_at = 0.0
+        self.face_miss = 0
+        self.voiced_run_sec = 0.0
+        if tail:
+            self.buf.extend(tail)
+            self.crops = tail_crops
+            self.last_crop = last_crop
+            self.last_voice_at = last_v
+            self.voiced_sec = min(self.voiced_sec, keep_sec)
+            if last_v > 0 and (time.time() - last_v) < SILENCE_FINAL_SEC:
+                self.last_voice_at = last_v
+            else:
+                self.last_voice_at = 0.0
+        else:
+            self.last_voice_at = 0.0
+            self.last_crop = None
+            self.voiced_sec = 0.0
 
     def discard(self) -> None:
-        self.commit()
+        self.commit(keep_sec=0.0)
 
     def trim_to(self, seconds: float) -> None:
         keep = int(self.sr * seconds) * 2
@@ -97,6 +142,7 @@ class LiveStream:
         return (
             not self.busy
             and self.last_voice_at > 0
+            and self.voiced_sec >= MIN_VOICED_SEC
             and self.buf_sec() >= MIN_FILE_SEC
             and (now - self.last_decode_at) >= HOP_SEC
         )
@@ -105,12 +151,19 @@ class LiveStream:
         return (
             not self.busy
             and self.last_voice_at > 0
+            and self.voiced_sec >= MIN_VOICED_SEC
             and self.buf_sec() >= 1.2
             and (now - self.last_voice_at) >= SILENCE_FINAL_SEC
+            and (now - self.last_decode_at) >= 0.45
         )
 
     def want_len_final(self) -> bool:
-        return not self.busy and self.last_voice_at > 0 and self.buf_sec() >= MAX_UTTER_SEC
+        return (
+            not self.busy
+            and self.last_voice_at > 0
+            and self.voiced_sec >= MIN_VOICED_SEC
+            and self.buf_sec() >= MAX_UTTER_SEC
+        )
 
 
 def chunk_is_voiced(pcm: bytes, peak_min: float = VOICE_PEAK) -> bool:
@@ -121,8 +174,12 @@ def chunk_is_voiced(pcm: bytes, peak_min: float = VOICE_PEAK) -> bool:
 
 
 def speaking_blocked(require_speaking: bool, face: dict) -> bool:
-    """Face visible and not talking → do not send this audio to ASR."""
-    return bool(require_speaking) and bool(face.get("found")) and not bool(face.get("speaking"))
+    """No face, or face not talking → do not send nearby audio to ASR."""
+    if not face.get("found"):
+        return True
+    if require_speaking and not face.get("speaking"):
+        return True
+    return False
 
 
 def audio_is_voiced(
@@ -131,10 +188,20 @@ def audio_is_voiced(
     speaking: bool,
     require_speaking: bool,
     face_found: bool,
+    now: float = 0.0,
+    last_voice_at: float = 0.0,
 ) -> bool:
-    if require_speaking:
-        return bool(face_found and speaking and chunk_is_voiced(pcm))
-    return chunk_is_voiced(pcm)
+    if not face_found:
+        return False
+    energy = chunk_is_voiced(pcm)
+    if not energy:
+        return False
+    if not require_speaking:
+        return True
+    if speaking:
+        return True
+    # Keep a started utterance through pauses between words/digits.
+    return last_voice_at > 0 and now > 0 and (now - last_voice_at) < HANGOVER_SEC
 
 
 def infer_window(
@@ -150,4 +217,5 @@ def infer_window(
         use_tse=use_tse,
         final=final,
         allow_greetings=allow_greetings,
+        fallback_raw=True,
     )

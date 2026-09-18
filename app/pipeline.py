@@ -23,6 +23,7 @@ def run_av_asr(
     use_tse: bool = True,
     final: bool = False,
     allow_greetings: bool | None = None,
+    fallback_raw: bool = False,
 ) -> tuple[str, bool]:
     """Extract target voice (optional) then transcribe. Returns (text, used_tse)."""
     raw = pcm16_to_float32(pcm_bytes)
@@ -40,11 +41,19 @@ def run_av_asr(
                 used_tse = True
             else:
                 logger.info(
-                    "AV-TSE output failed VAD %s; using raw mic",
+                    "AV-TSE output failed VAD %s%s",
                     speech_stats(extracted, SAMPLE_RATE),
+                    "; using raw mic" if fallback_raw else "; skip (not this speaker)",
                 )
+                if not fallback_raw:
+                    return "", False
         except Exception:
-            logger.exception("AV-TSE failed; using raw mic")
+            logger.exception("AV-TSE failed%s", "; using raw mic" if fallback_raw else "")
+            if not fallback_raw:
+                return "", False
+    elif use_tse and not fallback_raw:
+        logger.info("skip ASR: no face crops for target speaker")
+        return "", False
 
     text = transcribe_pcm16(
         _to_pcm16(audio),
@@ -52,7 +61,7 @@ def run_av_asr(
         final=final,
         allow_greetings=allow_greetings,
     )
-    if not text and used_tse:
+    if not text and used_tse and fallback_raw:
         logger.info("ASR empty after TSE; retry raw mic")
         text = transcribe_pcm16(
             _to_pcm16(raw),
