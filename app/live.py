@@ -46,6 +46,8 @@ class LiveStream:
     in_turn: bool = False
     speaker: str = ""
     pending_speaker: str = ""
+    last_lips_at: float = 0.0
+    snap_len: int = 0
     voiceprints: dict = field(default_factory=dict)
     enroll_buf: dict = field(default_factory=dict)
     enroll_new: dict = field(default_factory=dict)
@@ -98,6 +100,7 @@ class LiveStream:
         *,
         energy: bool = False,
         target: bool = False,
+        lips: bool = False,
     ) -> None:
         """Once the opposite face starts a turn, keep the waveform continuous.
 
@@ -108,15 +111,21 @@ class LiveStream:
             return
         self.last_audio_at = now
         chunk_sec = len(pcm) / (self.sr * 2)
-        if target:
+        if lips:
+            self.last_lips_at = now
+        # Fan or a played clip must not keep a turn alive once the mouth is still.
+        lips_recent = self.last_lips_at > 0 and (now - self.last_lips_at) < 0.4
+        if target and lips:
             self.saw_target = True
             self.in_turn = True
         if not self.in_turn:
             self.buf.extend(pcm)
             self.trim_to(PRE_ROLL_SEC)
             return
+        if not lips_recent:
+            return
         self.buf.extend(pcm)
-        if energy:
+        if energy and lips_recent:
             self.last_voice_at = now
             self.voiced_sec += chunk_sec
             self.voiced_run_sec = min(2.0, self.voiced_run_sec + chunk_sec)
@@ -145,13 +154,28 @@ class LiveStream:
             self.crops = self.crops[-90:]
 
     def snapshot(self) -> tuple[bytes, list[Any]]:
+        self.snap_len = len(self.buf)
         return bytes(self.buf), list(self.crops)
 
     def commit(self, keep_sec: float = COMMIT_OVERLAP_SEC) -> None:
         """End an utterance but keep a tail so words said during ASR are not wiped."""
-        keep_b = int(self.sr * max(0.0, keep_sec)) * 2
-        tail = bytes(self.buf[-keep_b:]) if keep_b and self.buf else b""
-        tail_crops = list(self.crops[-25:]) if keep_b and self.crops else []
+        # Audio that landed while ASR was running is the cut-off ending.
+        arrived = b""
+        if self.snap_len and len(self.buf) > self.snap_len:
+            arrived = bytes(self.buf[self.snap_len :])
+            cap = int(self.sr * 2.5) * 2
+            if len(arrived) > cap:
+                arrived = arrived[-cap:]
+        lips_fresh = self.last_lips_at > 0 and (time.time() - self.last_lips_at) < 0.5
+        if arrived and lips_fresh:
+            tail = arrived
+            keep_sec = max(keep_sec, len(tail) / (self.sr * 2))
+        elif lips_fresh and keep_sec > 0 and self.buf:
+            keep_b = int(self.sr * keep_sec) * 2
+            tail = bytes(self.buf[-keep_b:])
+        else:
+            tail = b""
+        tail_crops = list(self.crops[-25:]) if tail and self.crops else []
         last_v = self.last_voice_at
         last_crop = self.last_crop
         self.buf.clear()
@@ -178,6 +202,7 @@ class LiveStream:
             self.last_voice_at = 0.0
             self.last_crop = None
             self.voiced_sec = 0.0
+        self.snap_len = 0
 
     def discard(self) -> None:
         self.commit(keep_sec=0.0)

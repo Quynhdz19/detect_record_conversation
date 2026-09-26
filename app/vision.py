@@ -329,16 +329,6 @@ class FaceMouthTracker:
                 }
             )
 
-        if audio_voice and len(cues) >= 2:
-            ranked = sorted(cues, key=lambda c: c.mouth_open, reverse=True)
-            if ranked[0].mouth_open >= ranked[1].mouth_open + 0.04:
-                for cue in cues:
-                    winner = cue is ranked[0]
-                    cue.speaking = winner
-                    cue.lip_active = winner
-                for person, cue in zip(people, cues):
-                    person["speaking"] = cue.speaking
-                    person["lip_active"] = cue.lip_active
         self.people = people
         lippers = [c for c in cues if c.lip_active]
         if len(lippers) == 1:

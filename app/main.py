@@ -375,7 +375,7 @@ async def ws_session(websocket: WebSocket):
                     "people": people,
                     "voices": sorted(live.voiceprints),
                 }
-                if cue.speaking and cue.speaker:
+                if cue.lip_active and cue.speaking and cue.speaker:
                     cut = live.take_turn_for(cue.speaker)
                     if cut:
                         prev, pcm_cut, crops_cut = cut
@@ -393,16 +393,21 @@ async def ws_session(websocket: WebSocket):
             now = time.time()
             get_tracker().note_pcm16(payload, now)
             energy = chunk_is_voiced(payload, TURN_ENERGY)
+            lips_now = bool(last_face.get("lip_active")) or any(
+                p.get("lip_active") for p in (last_face.get("people") or [])
+            )
+            # A turn starts only while the mouth is moving. Closed lips + fan/playback do not.
             target = (
                 require_speaking
                 and bool(last_face.get("found"))
                 and bool(last_face.get("frontal", True))
-                and bool(last_face.get("speaking") or last_face.get("lip_active"))
+                and lips_now
                 and chunk_is_voiced(payload, VOICE_PEAK)
             )
             if not require_speaking:
                 target = bool(last_face.get("found")) and energy
-            live.push_audio(payload, now, energy=energy or target, target=target)
+                lips_now = True
+            live.push_audio(payload, now, energy=energy, target=target, lips=lips_now)
             # Learn a voice only from the mouth that is moving now, so B is not
             # saved into A's profile while A's "still talking" hold is on.
             lippers = [
