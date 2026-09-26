@@ -12,3 +12,4 @@ mediapipe
 soundfile
 clearvoice
 python_speech_features
+sherpa-onnx

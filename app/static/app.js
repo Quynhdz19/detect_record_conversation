@@ -41,22 +41,24 @@
     banner.className = "banner" + (kind ? " " + kind : "");
   }
 
-  function pushTranscript(text, final, usedTse) {
+  function pushTranscript(text, final, usedTse, speaker) {
     if (!text || !String(text).trim()) return;
-    const prefix = usedTse ? "" : "[raw] ";
-    const shown = String(text).trim();
-    if (!final && lines.length && lines[lines.length - 1].startsWith("… ")) {
-      lines[lines.length - 1] = "… " + prefix + shown;
-    } else if (!final) {
-      lines.push("… " + prefix + shown);
-    } else if (lines.length && lines[lines.length - 1].startsWith("… ")) {
-      lines[lines.length - 1] = prefix + shown;
+    const who = speaker ? speaker + ": " : "";
+    const body = String(text).trim();
+    const shown = who + body;
+    const pending = "… " + who;
+    if (!final) {
+      const i = lines.findIndex((line) => line.startsWith(pending));
+      if (i >= 0) lines[i] = pending + body;
+      else lines.push(pending + body);
     } else {
-      lines.push(prefix + shown);
+      const i = lines.findIndex((line) => line.startsWith(pending));
+      if (i >= 0) lines[i] = shown;
+      else lines.push(shown);
     }
     transcriptEl.textContent = lines.join("\n");
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
-    setBanner((final ? "Câu: " : "… ") + "<strong>" + shown.replace(/</g, "") + "</strong>", "ok");
+    setBanner((final ? "" : "… ") + "<strong>" + shown.replace(/</g, "") + "</strong>", "ok");
   }
 
   function resizeOverlay() {
@@ -73,16 +75,28 @@
     const w = video.clientWidth;
     const h = video.clientHeight;
     ctx.clearRect(0, 0, w, h);
-    if (!face || !face.found || !w) return;
-    const x = face.x * w;
-    const y = face.y * h;
-    const bw = face.w * w;
-    const bh = face.h * h;
-    ctx.strokeStyle = face.speaking ? "#1f8f4e" : "#f0c14b";
-    ctx.lineWidth = 3;
-    ctx.strokeRect(x, y, bw, bh);
-    ctx.fillStyle = face.speaking ? "rgba(31,143,78,0.16)" : "rgba(240,193,75,0.12)";
-    ctx.fillRect(x, y, bw, bh);
+    const people = face && face.people && face.people.length
+      ? face.people
+      : face && face.found ? [face] : [];
+    if (!w || !people.length) return;
+    const palette = { A: "#1f8f4e", B: "#2f6fed" };
+    for (const person of people) {
+      const color = palette[person.speaker] || "#f0c14b";
+      const x = person.x * w;
+      const y = person.y * h;
+      const bw = person.w * w;
+      const bh = person.h * h;
+      ctx.strokeStyle = person.speaking ? color : "#f0c14b";
+      ctx.lineWidth = 3;
+      ctx.strokeRect(x, y, bw, bh);
+      ctx.fillStyle = person.speaking ? color + "22" : "rgba(240,193,75,0.12)";
+      ctx.fillRect(x, y, bw, bh);
+      if (person.speaker) {
+        ctx.fillStyle = color;
+        ctx.font = "700 16px sans-serif";
+        ctx.fillText(person.speaker, x + 6, Math.max(18, y - 6));
+      }
+    }
   }
 
   function downsampleTo16k(float32, inputRate) {
@@ -169,20 +183,27 @@
           setMeta(`${msg.av_tse_model} + ${msg.asr_model} · ${msg.device} · live`);
         } else if (msg.type === "face") {
           face = msg;
-          if (!msg.found) {
+          const people = msg.people || [];
+          const labels = people.map((p) => p.speaker).filter(Boolean);
+          const talking = people.filter((p) => p.speaking).map((p) => p.speaker);
+          if (!msg.found && !people.length) {
             faceStatus.textContent = "Chưa thấy mặt";
+          } else if (labels.length) {
+            faceStatus.textContent = "Trong khung: " + labels.join(", ");
           } else if (msg.frontal === false) {
             faceStatus.textContent = "Mặt lệch — hãy nhìn camera";
           } else {
-            faceStatus.textContent = "Đã khóa người đối diện";
+            faceStatus.textContent = "Đã thấy mặt";
           }
-          if (msg.speaking) {
-            const sc = msg.asd_score != null ? Number(msg.asd_score).toFixed(1) : "";
-            speakStatus.textContent = sc ? `Đang nói (${sc})` : "Đang nói";
-          } else if (msg.lip_active && msg.frontal === false) {
-            speakStatus.textContent = "Không nhìn cam";
+          const voices = msg.voices || [];
+          if (talking.length) {
+            speakStatus.textContent = "Đang nói: " + talking.join(", ");
+          } else if (voices.length >= 2) {
+            speakStatus.textContent = "Đã tách giọng " + voices.join(" / ");
+          } else if (voices.length === 1) {
+            speakStatus.textContent = "Đã nhớ giọng " + voices[0];
           } else if (msg.lip_active) {
-            speakStatus.textContent = "Môi nhúc — chưa khớp giọng";
+            speakStatus.textContent = "Môi nhúc";
           } else {
             speakStatus.textContent = "Không nói";
           }
@@ -193,7 +214,7 @@
           tseStatus.textContent = msg.text || "AV-TSE";
           tseStatus.classList.toggle("hot", /tách|TSE|load/i.test(msg.text || ""));
         } else if (msg.type === "transcript") {
-          pushTranscript(msg.text, !!msg.final, !!msg.used_tse);
+          pushTranscript(msg.text, !!msg.final, !!msg.used_tse, msg.speaker || "");
           if (msg.used_tse) {
             tseStatus.textContent = "AV-TSE OK";
             tseStatus.classList.add("hot");
@@ -378,7 +399,7 @@
     flushBtn.disabled = false;
     if (frameTimer) clearInterval(frameTimer);
     frameTimer = setInterval(sendVideoFrame, 40);
-    setBanner("Đang stream 25fps + mic 16kHz → TalkNet → AV-TSE 3s → PhoWhisper.", "ok");
+    setBanner("Đang nghe người đối diện → Zipformer tiếng Việt.", "ok");
   }
 
   function stopAll() {

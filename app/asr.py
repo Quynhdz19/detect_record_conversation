@@ -1,9 +1,12 @@
-"""Vietnamese ASR with PhoWhisper-small."""
+"""Vietnamese ASR. Live path uses Zipformer-30M (sherpa-onnx); PhoWhisper is fallback."""
 
 from __future__ import annotations
 
 import logging
+import tarfile
+import urllib.request
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -12,7 +15,16 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "vinai/PhoWhisper-small"
+# Streaming-style RNN-T trained on ~6000h Vietnamese. Much smaller and
+# faster than PhoWhisper-small, and it does not wait on a 30s Whisper window.
+MODEL_ID = "hynt/Zipformer-30M-RNNT-6000h"
+WHISPER_ID = "vinai/PhoWhisper-small"
+_ROOT = Path(__file__).resolve().parents[1]
+_ZIP_DIR = _ROOT / "checkpoints" / "sherpa-onnx-zipformer-vi-30M-int8-2026-02-09"
+_ZIP_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "sherpa-onnx-zipformer-vi-30M-int8-2026-02-09.tar.bz2"
+)
 
 
 def pick_device() -> tuple[str, str]:
@@ -61,15 +73,60 @@ def pcm16_to_float32(pcm_bytes: bytes) -> np.ndarray:
     return audio / 32768.0
 
 
-def peak_normalize(audio: np.ndarray, target: float = 0.85) -> np.ndarray:
-    """Bring conversational speech to a Whisper-friendly level without exploding hush."""
+def peak_normalize(audio: np.ndarray, target: float = 0.85, max_gain: float = 8.0) -> np.ndarray:
+    """Bring conversational speech up without exploding hush."""
     audio = np.asarray(audio, dtype=np.float32).reshape(-1)
     if audio.size == 0:
         return audio
     peak = float(np.max(np.abs(audio)))
     if peak < 0.02:
         return audio
-    return np.clip(audio * min(target / peak, 8.0), -1.0, 1.0)
+    return np.clip(audio * min(target / peak, max_gain), -1.0, 1.0)
+
+
+def _ensure_zipformer() -> Path:
+    if (_ZIP_DIR / "encoder.int8.onnx").exists() and (_ZIP_DIR / "tokens.txt").exists():
+        return _ZIP_DIR
+    logger.info("Downloading %s …", MODEL_ID)
+    _ZIP_DIR.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _ZIP_DIR.parent / "zipformer-vi.tar.bz2"
+    urllib.request.urlretrieve(_ZIP_URL, tmp)
+    with tarfile.open(tmp) as tar:
+        tar.extractall(_ZIP_DIR.parent)
+    tmp.unlink(missing_ok=True)
+    if not (_ZIP_DIR / "encoder.int8.onnx").exists():
+        raise FileNotFoundError(f"Zipformer extract missing encoder in {_ZIP_DIR}")
+    return _ZIP_DIR
+
+
+@lru_cache(maxsize=1)
+def get_zipformer():
+    import sherpa_onnx
+
+    root = _ensure_zipformer()
+    logger.info("Loading %s (int8 CPU)…", MODEL_ID)
+    rec = sherpa_onnx.OfflineRecognizer.from_transducer(
+        encoder=str(root / "encoder.int8.onnx"),
+        decoder=str(root / "decoder.onnx"),
+        joiner=str(root / "joiner.int8.onnx"),
+        tokens=str(root / "tokens.txt"),
+        num_threads=2,
+        sample_rate=16000,
+        feature_dim=80,
+        decoding_method="modified_beam_search",
+        max_active_paths=4,
+        provider="cpu",
+    )
+    logger.info("Zipformer ready.")
+    return rec
+
+
+def _zipformer_text(audio: np.ndarray, sample_rate: int) -> str:
+    rec = get_zipformer()
+    stream = rec.create_stream()
+    stream.accept_waveform(sample_rate, np.ascontiguousarray(audio, dtype=np.float32))
+    rec.decode_stream(stream)
+    return (stream.result.text or "").strip().lower()
 
 
 # Whisper invents these on silence / room noise
@@ -217,11 +274,23 @@ def transcribe_pcm16(
     if len(pcm_bytes) < int(sample_rate * 0.7):  # < ~0.35s of int16 mono
         return ""
 
-    audio = peak_normalize(pcm16_to_float32(pcm_bytes))
+    # Mild gain only. Zipformer was trained on normal speech, not 8x boosted noise.
+    audio = peak_normalize(pcm16_to_float32(pcm_bytes), target=0.55, max_gain=3.0)
     stats = speech_stats(audio, sample_rate)
     if not looks_like_speech(audio, sample_rate):
         logger.info("skip ASR: not speech %s", stats)
         return ""
+
+    try:
+        raw_text = _zipformer_text(audio, sample_rate)
+        text = clean_transcript(raw_text, final=final, allow_greetings=allow_greetings)
+        if text:
+            logger.info("Zipformer ok %r stats=%s", text, stats)
+        else:
+            logger.info("Zipformer cleaned empty from %r stats=%s", raw_text, stats)
+        return text
+    except Exception:
+        logger.exception("Zipformer failed; falling back to PhoWhisper")
 
     asr = get_transcriber()
     nsp = _no_speech_prob(asr, audio, sample_rate)

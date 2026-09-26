@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from app.asr import (
     MODEL_ID,
     clean_transcript,
-    get_transcriber,
+    get_zipformer,
     pick_device,
 )
 from app.av_tse import SAMPLE_RATE, get_av_tse
@@ -34,6 +34,7 @@ from app.live import (
 from app.pi_api import router as pi_router
 from app.video_pipeline import TMP_ROOT, process_mp4
 from app.vision import get_tracker
+from app.voice import blend, embed_pcm16, get_extractor, match_voice
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -54,11 +55,15 @@ BOOT: dict[str, Any] = {
 
 def _warm_models() -> None:
     try:
-        device, dtype = pick_device()
-        BOOT["stage"] = f"loading PhoWhisper ({device})"
-        logger.info("Warming PhoWhisper %s on %s/%s", MODEL_ID, device, dtype)
-        get_transcriber()
+        BOOT["stage"] = "loading Zipformer-30M (CPU)"
+        logger.info("Warming %s", MODEL_ID)
+        get_zipformer()
         BOOT["asr_ready"] = True
+        try:
+            BOOT["stage"] = "loading speaker embedding"
+            get_extractor()
+        except Exception:
+            logger.exception("Speaker embedding unavailable; A/B voice filter off")
 
         BOOT["stage"] = "loading Face Landmarker"
         get_tracker()
@@ -215,19 +220,32 @@ async def ws_session(websocket: WebSocket):
             return
         live.busy = True
         live.last_decode_at = time.time()
-        asyncio.create_task(process_chunk(final))
+        asyncio.create_task(process_chunk(final, live.speaker))
 
-    async def process_chunk(final: bool = False) -> None:
+    async def process_chunk(
+        final: bool = False,
+        speaker: str = "",
+        pcm: bytes | None = None,
+        crops_in: list | None = None,
+    ) -> None:
         try:
             if not BOOT["asr_ready"]:
                 await websocket.send_json({"type": "status", "text": "ASR chưa sẵn sàng…"})
                 return
-            await websocket.send_json({"type": "status", "text": "Tách giọng người đối diện…"})
-            chunk, crops = live.snapshot()
+            who = speaker or live.speaker or ""
+            await websocket.send_json(
+                {"type": "status", "text": f"Đang nghe người {who}…" if who else "Đang nghe…"}
+            )
+            owns_buffer = pcm is None
+            if owns_buffer:
+                chunk, crops = live.snapshot()
+            else:
+                chunk, crops = pcm, list(crops_in or [])
             allow_greetings = final and live.last_voice_at > 0
             # Buffer is already the confirmed turn, so raw is safe if TSE
             # smears a single talker (common at normal speed, little overlap).
-            fallback_raw = (not require_speaking) or live.saw_target
+            fallback_raw = (not require_speaking) or live.saw_target or bool(who)
+            separate = len(live.voiceprints) >= 2
             text, used_tse = await loop.run_in_executor(
                 None,
                 infer_window,
@@ -237,7 +255,15 @@ async def ws_session(websocket: WebSocket):
                 final,
                 allow_greetings,
                 fallback_raw,
+                separate,
             )
+            if text and separate:
+                owner = await loop.run_in_executor(
+                    None, match_voice, chunk, dict(live.voiceprints)
+                )
+                if owner and who and owner != who:
+                    logger.info("drop text for %s; voice matches %s", who, owner)
+                    text = ""
             text = clean_transcript(text, final=final, allow_greetings=allow_greetings)
             if text:
                 live.had_speech = True
@@ -254,12 +280,13 @@ async def ws_session(websocket: WebSocket):
                         "text": text,
                         "final": final,
                         "used_tse": used_tse,
+                        "speaker": who,
                         "face": last_face,
                     }
                 )
             else:
                 logger.info("live ASR empty final=%s buf=%.2fs", final, live.buf_sec())
-            if final:
+            if final and owns_buffer:
                 live.commit()
             if text:
                 await websocket.send_json({"type": "status", "text": "Đang nghe…"})
@@ -269,6 +296,21 @@ async def ws_session(websocket: WebSocket):
             logger.exception("live decode failed")
         finally:
             live.busy = False
+            if live.pending_speaker and live.pending_speaker != live.speaker:
+                live.speaker = live.pending_speaker
+            live.pending_speaker = ""
+
+    async def _remember_voice(label: str, sample: bytes) -> None:
+        try:
+            vec = await loop.run_in_executor(None, embed_pcm16, sample)
+            if vec is None:
+                return
+            live.voiceprints[label] = blend(live.voiceprints.get(label), vec)
+            logger.info("remembered voice %s (%d enrolled)", label, len(live.voiceprints))
+        except Exception:
+            logger.exception("voice enroll failed")
+        finally:
+            live.enroll_busy = False
 
     async def maybe_decode() -> None:
         now = time.time()
@@ -314,6 +356,7 @@ async def ws_session(websocket: WebSocket):
                 if not BOOT["vision_ready"]:
                     continue
                 cue = await loop.run_in_executor(None, get_tracker().analyze_jpeg, payload)
+                people = list(getattr(get_tracker(), "people", []))
                 last_face = {
                     "found": cue.found,
                     "x": cue.x,
@@ -326,9 +369,19 @@ async def ws_session(websocket: WebSocket):
                     "asd_score": getattr(cue, "asd_score", 0.0),
                     "frontal": getattr(cue, "frontal", False),
                     "frontal_score": getattr(cue, "frontal_score", 0.0),
+                    "speaker": getattr(cue, "speaker", ""),
                     "cx": cue.cx,
                     "cy": cue.cy,
+                    "people": people,
+                    "voices": sorted(live.voiceprints),
                 }
+                if cue.speaking and cue.speaker:
+                    cut = live.take_turn_for(cue.speaker)
+                    if cut:
+                        prev, pcm_cut, crops_cut = cut
+                        live.busy = True
+                        live.last_decode_at = time.time()
+                        asyncio.create_task(process_chunk(True, prev, pcm_cut, crops_cut))
                 live.note_face(cue.face_bgr if cue.found else None, found=bool(cue.found))
                 await websocket.send_json({"type": "face", **last_face})
                 await maybe_decode()
@@ -350,6 +403,17 @@ async def ws_session(websocket: WebSocket):
             if not require_speaking:
                 target = bool(last_face.get("found")) and energy
             live.push_audio(payload, now, energy=energy or target, target=target)
+            # Learn a voice only from the mouth that is moving now, so B is not
+            # saved into A's profile while A's "still talking" hold is on.
+            lippers = [
+                p.get("speaker")
+                for p in (last_face.get("people") or [])
+                if p.get("lip_active") and p.get("speaker")
+            ]
+            if len(set(lippers)) == 1 and chunk_is_voiced(payload, VOICE_PEAK):
+                sample = live.push_enroll(lippers[0], payload)
+                if sample:
+                    asyncio.create_task(_remember_voice(lippers[0], sample))
             await maybe_decode()
 
     except WebSocketDisconnect:

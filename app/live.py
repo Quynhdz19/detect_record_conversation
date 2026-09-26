@@ -44,6 +44,49 @@ class LiveStream:
     voiced_run_sec: float = 0.0
     saw_target: bool = False
     in_turn: bool = False
+    speaker: str = ""
+    pending_speaker: str = ""
+    voiceprints: dict = field(default_factory=dict)
+    enroll_buf: dict = field(default_factory=dict)
+    enroll_new: dict = field(default_factory=dict)
+    enroll_busy: bool = False
+
+    def push_enroll(self, label: str, pcm: bytes) -> bytes | None:
+        """Collect a clean clip of one person. Returns audio once there is enough to embed."""
+        if not label or not pcm:
+            return None
+        buf = self.enroll_buf.setdefault(label, bytearray())
+        buf.extend(pcm)
+        max_b = self.sr * 4 * 2
+        if len(buf) > max_b:
+            del buf[: len(buf) - max_b]
+        self.enroll_new[label] = self.enroll_new.get(label, 0.0) + len(pcm) / (self.sr * 2)
+        if self.enroll_busy or self.enroll_new[label] < 1.2 or len(buf) < self.sr * 2:
+            return None
+        self.enroll_new[label] = 0.0
+        self.enroll_busy = True
+        return bytes(buf[-(self.sr * 2 * 2) :])
+
+    def take_turn_for(self, label: str) -> tuple[str, bytes, list[Any]] | None:
+        """Switch A/B. Returns the previous speaker's audio if a turn must be closed."""
+        if not label:
+            return None
+        if self.busy:
+            self.pending_speaker = label
+            return None
+        if not self.speaker:
+            self.speaker = label
+            return None
+        if label == self.speaker:
+            return None
+        prev = self.speaker
+        if self.in_turn and self.last_voice_at > 0 and self.buf_sec() >= 0.8:
+            pcm, crops = self.snapshot()
+            self.commit(keep_sec=0.0)
+            self.speaker = label
+            return prev, pcm, crops
+        self.speaker = label
+        return None
 
     def buf_sec(self) -> float:
         return len(self.buf) / (self.sr * 2)
@@ -229,6 +272,7 @@ def infer_window(
     final: bool = False,
     allow_greetings: bool = False,
     fallback_raw: bool = False,
+    separate_voices: bool = False,
 ) -> tuple[str, bool]:
     return run_av_asr(
         pcm,
@@ -237,4 +281,5 @@ def infer_window(
         final=final,
         allow_greetings=allow_greetings,
         fallback_raw=fallback_raw,
+        separate_voices=separate_voices,
     )

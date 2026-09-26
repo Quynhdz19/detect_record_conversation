@@ -37,6 +37,7 @@ def run_av_asr(
     final: bool = False,
     allow_greetings: bool | None = None,
     fallback_raw: bool = False,
+    separate_voices: bool = False,
 ) -> tuple[str, bool]:
     """Extract target voice (optional) then transcribe. Returns (text, used_tse)."""
     raw = pcm16_to_float32(pcm_bytes)
@@ -49,9 +50,19 @@ def run_av_asr(
     if use_tse and face_crops:
         try:
             extracted = get_av_tse().extract(raw, face_crops)
-            if _is_target_extract(raw, extracted):
+            rs = speech_stats(raw, SAMPLE_RATE)
+            es = speech_stats(extracted, SAMPLE_RATE)
+            ratio = es["rms"] / max(rs["rms"], 1e-6)
+            # TSE helps when it actually removes another voice. On a single
+            # facing speaker it mostly adds artifacts, so Zipformer hears the
+            # gated mic instead.
+            if _is_target_extract(raw, extracted) and (ratio < 0.8 or separate_voices):
                 audio = extracted
                 used_tse = True
+                logger.info("AV-TSE overlap extract ratio=%.2f", ratio)
+            elif fallback_raw:
+                logger.info("single-speaker turn, ASR on gated mic ratio=%.2f", ratio)
+                audio = raw
             else:
                 logger.info(
                     "AV-TSE output failed VAD %s%s",

@@ -1,12 +1,11 @@
-"""Download PhoWhisper-small into local HuggingFace cache."""
+"""Download the Vietnamese Zipformer ASR used for live captions."""
 
-from app.asr import MODEL_ID, get_transcriber, pick_device
+from app.asr import MODEL_ID, get_zipformer
 
 
 def main() -> None:
-    device, dtype = pick_device()
-    print(f"Downloading/loading {MODEL_ID} on {device}/{dtype} ...")
-    get_transcriber()
+    print(f"Downloading/loading {MODEL_ID} ...")
+    get_zipformer()
     print("Done. Model cached and ready.")
 
 
