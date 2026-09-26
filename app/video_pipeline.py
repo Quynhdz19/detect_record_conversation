@@ -23,7 +23,7 @@ TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 # Demo limits
 MAX_SECONDS = 30.0
-FACE_SAMPLE_FPS = 8.0
+FACE_SAMPLE_FPS = 12.5
 
 
 def _run(cmd: list[str]) -> None:

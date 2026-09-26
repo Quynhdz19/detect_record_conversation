@@ -86,11 +86,19 @@
   }
 
   function downsampleTo16k(float32, inputRate) {
-    if (inputRate === TARGET_SR) return float32;
+    if (Math.abs(inputRate - TARGET_SR) < 1) return float32;
     const ratio = inputRate / TARGET_SR;
     const newLen = Math.floor(float32.length / ratio);
     const out = new Float32Array(newLen);
-    for (let i = 0; i < newLen; i++) out[i] = float32[Math.floor(i * ratio)];
+    for (let i = 0; i < newLen; i++) {
+      const start = i * ratio;
+      const end = Math.min(float32.length, (i + 1) * ratio);
+      const i0 = Math.floor(start);
+      const i1 = Math.max(i0 + 1, Math.min(float32.length, Math.ceil(end)));
+      let sum = 0;
+      for (let j = i0; j < i1; j++) sum += float32[j];
+      out[i] = sum / (i1 - i0);
+    }
     return out;
   }
 
@@ -115,12 +123,12 @@
   async function sendVideoFrame() {
     if (!listening || !video.videoWidth) return;
     const canvas = document.createElement("canvas");
-    const scale = 480 / Math.max(video.videoWidth, video.videoHeight);
+    const scale = 400 / Math.max(video.videoWidth, video.videoHeight);
     canvas.width = Math.max(2, Math.round(video.videoWidth * scale));
     canvas.height = Math.max(2, Math.round(video.videoHeight * scale));
     const c = canvas.getContext("2d", { willReadFrequently: false });
     c.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const blob = await new Promise((r) => canvas.toBlob(r, "image/jpeg", 0.72));
+    const blob = await new Promise((r) => canvas.toBlob(r, "image/jpeg", 0.62));
     if (!blob) return;
     sendBinary(1, new Uint8Array(await blob.arrayBuffer()));
   }
@@ -161,12 +169,20 @@
           setMeta(`${msg.av_tse_model} + ${msg.asr_model} · ${msg.device} · live`);
         } else if (msg.type === "face") {
           face = msg;
-          faceStatus.textContent = msg.found ? "Đã khóa mặt" : "Chưa thấy mặt";
+          if (!msg.found) {
+            faceStatus.textContent = "Chưa thấy mặt";
+          } else if (msg.frontal === false) {
+            faceStatus.textContent = "Mặt lệch — hãy nhìn camera";
+          } else {
+            faceStatus.textContent = "Đã khóa người đối diện";
+          }
           if (msg.speaking) {
             const sc = msg.asd_score != null ? Number(msg.asd_score).toFixed(1) : "";
-            speakStatus.textContent = sc ? `TalkNet đang nói (${sc})` : "Đang nói";
+            speakStatus.textContent = sc ? `Đang nói (${sc})` : "Đang nói";
+          } else if (msg.lip_active && msg.frontal === false) {
+            speakStatus.textContent = "Không nhìn cam";
           } else if (msg.lip_active) {
-            speakStatus.textContent = "Môi nhúc — TalkNet chưa xác nhận";
+            speakStatus.textContent = "Môi nhúc — chưa khớp giọng";
           } else {
             speakStatus.textContent = "Không nói";
           }
@@ -361,8 +377,8 @@
     listenBtn.disabled = true;
     flushBtn.disabled = false;
     if (frameTimer) clearInterval(frameTimer);
-    frameTimer = setInterval(sendVideoFrame, 80);
-    setBanner("Đang stream camera/mic → AV-TSE → PhoWhisper.", "ok");
+    frameTimer = setInterval(sendVideoFrame, 40);
+    setBanner("Đang stream 25fps + mic 16kHz → TalkNet → AV-TSE 3s → PhoWhisper.", "ok");
   }
 
   function stopAll() {

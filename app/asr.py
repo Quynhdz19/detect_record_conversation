@@ -61,6 +61,17 @@ def pcm16_to_float32(pcm_bytes: bytes) -> np.ndarray:
     return audio / 32768.0
 
 
+def peak_normalize(audio: np.ndarray, target: float = 0.85) -> np.ndarray:
+    """Bring conversational speech to a Whisper-friendly level without exploding hush."""
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if audio.size == 0:
+        return audio
+    peak = float(np.max(np.abs(audio)))
+    if peak < 0.02:
+        return audio
+    return np.clip(audio * min(target / peak, 8.0), -1.0, 1.0)
+
+
 # Whisper invents these on silence / room noise
 _HALLUCINATION_EXACT = {
     "cảm ơn",
@@ -206,7 +217,7 @@ def transcribe_pcm16(
     if len(pcm_bytes) < int(sample_rate * 0.7):  # < ~0.35s of int16 mono
         return ""
 
-    audio = pcm16_to_float32(pcm_bytes)
+    audio = peak_normalize(pcm16_to_float32(pcm_bytes))
     stats = speech_stats(audio, sample_rate)
     if not looks_like_speech(audio, sample_rate):
         logger.info("skip ASR: not speech %s", stats)
@@ -221,7 +232,8 @@ def transcribe_pcm16(
     generate_kwargs = {
         "task": "transcribe",
         "temperature": 0.0,
-        "no_repeat_ngram_size": 3,
+        "do_sample": False,
+        "num_beams": 3 if final else 1,
     }
     if language:
         generate_kwargs["language"] = language

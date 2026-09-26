@@ -17,6 +17,12 @@ UPPER_LIP = 13
 LOWER_LIP = 14
 MOUTH_LEFT = 61
 MOUTH_RIGHT = 291
+NOSE_TIP = 1
+LEFT_EYE_OUTER = 33
+RIGHT_EYE_OUTER = 263
+FRONTAL_MIN = 0.42
+# ClearVoice AV-TSE / TalkNet demo: square face crop, pad 0.40, then 224×224.
+CROP_SCALE = 0.40
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "face_landmarker.task"
 
@@ -44,6 +50,8 @@ class FaceCue:
     asd_score: float = 0.0
     cx: float = 0.5
     cy: float = 0.5
+    frontal: bool = False
+    frontal_score: float = 0.0
     face_bgr: Optional[np.ndarray] = field(default=None, repr=False)
 
 
@@ -53,6 +61,67 @@ def _blend_map(categories) -> dict[str, float]:
         name = getattr(cat, "category_name", None) or getattr(cat, "display_name", "")
         out[str(name)] = float(getattr(cat, "score", 0.0))
     return out
+
+
+def _face_box(face) -> tuple[float, float, float, float]:
+    xs = [lm.x for lm in face]
+    ys = [lm.y for lm in face]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _frontal_score(face) -> float:
+    """1 = nhìn thẳng camera, 0 = nghiêng / nghiêng vai."""
+    left, right, nose = face[LEFT_EYE_OUTER], face[RIGHT_EYE_OUTER], face[NOSE_TIP]
+    eye_w = abs(right.x - left.x) + 1e-6
+    yaw = abs(nose.x - 0.5 * (left.x + right.x)) / eye_w
+    x0, y0, x1, y1 = _face_box(face)
+    aspect = (x1 - x0) / max(y1 - y0, 1e-6)
+    yaw_score = max(0.0, 1.0 - yaw / 0.45)
+    aspect_score = min(1.0, aspect / 0.72)
+    return float(0.72 * yaw_score + 0.28 * aspect_score)
+
+
+def _pick_opposite_face(faces) -> int:
+    """Người đối diện: mặt to, nhìn cam, gần giữa khung."""
+    best_i, best = 0, -1.0
+    for i, face in enumerate(faces):
+        x0, y0, x1, y1 = _face_box(face)
+        area = max(1e-6, (x1 - x0) * (y1 - y0))
+        front = _frontal_score(face)
+        cx = 0.5 * (x0 + x1)
+        cy = 0.5 * (y0 + y1)
+        center = 1.0 - min(1.0, ((cx - 0.5) ** 2 + (cy - 0.48) ** 2) ** 0.5)
+        score = area * (0.3 + 0.7 * front) * (0.75 + 0.25 * center)
+        if score > best:
+            best, best_i = score, i
+    return best_i
+
+
+def crop_face_clearvoice(
+    bgr: np.ndarray,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    crop_scale: float = CROP_SCALE,
+) -> Optional[np.ndarray]:
+    """Square 224 crop used by ClearVoice video_process.crop_video / TalkNet demo."""
+    h, w = bgr.shape[:2]
+    cx = 0.5 * (x0 + x1) * w
+    cy = 0.5 * (y0 + y1) * h
+    s = max((x1 - x0) * w, (y1 - y0) * h) / 2.0
+    if s < 4:
+        return None
+    bsi = max(1, int(s * (1 + 2 * crop_scale)))
+    padded = np.pad(bgr, ((bsi, bsi), (bsi, bsi), (0, 0)), mode="constant", constant_values=110)
+    mx, my = cx + bsi, cy + bsi
+    face = padded[
+        int(my - s) : int(my + s * (1 + 2 * crop_scale)),
+        int(mx - s * (1 + crop_scale)) : int(mx + s * (1 + crop_scale)),
+    ]
+    if face.size == 0 or min(face.shape[:2]) < 8:
+        return None
+    return cv2.resize(face, (224, 224), interpolation=cv2.INTER_AREA)
 
 
 def _zero_crossings(arr: np.ndarray) -> int:
@@ -86,6 +155,7 @@ class FaceMouthTracker:
         self._last_loud_at = 0.0
         self._last_audio_at = 0.0
         self._speak_hold = 0
+        self._box_ema: Optional[np.ndarray] = None
 
     def close(self) -> None:
         self._landmarker.close()
@@ -128,19 +198,10 @@ class FaceMouthTracker:
             self._reset_motion()
             return FaceCue(found=False)
 
-        best_i = 0
-        best_dist = 1e9
-        for i, face in enumerate(result.face_landmarks):
-            xs = [lm.x for lm in face]
-            ys = [lm.y for lm in face]
-            cx = float(np.mean(xs))
-            cy = float(np.mean(ys))
-            dist = (cx - 0.5) ** 2 + (cy - 0.5) ** 2
-            if dist < best_dist:
-                best_dist = dist
-                best_i = i
-
+        best_i = _pick_opposite_face(result.face_landmarks)
         best = result.face_landmarks[best_i]
+        frontal_score = _frontal_score(best)
+        frontal = frontal_score >= FRONTAL_MIN
         xs = [lm.x for lm in best]
         ys = [lm.y for lm in best]
         x0, x1 = min(xs), max(xs)
@@ -148,18 +209,21 @@ class FaceMouthTracker:
         cx = float(np.mean(xs))
         cy = float(np.mean(ys))
 
-        pad = 0.25
-        bw, bh = x1 - x0, y1 - y0
-        x0e, x1e = max(0.0, x0 - pad * bw), min(1.0, x1 + pad * bw)
-        y0e, y1e = max(0.0, y0 - pad * bh), min(1.0, y1 + pad * bh)
-        px0, px1 = int(x0e * w), int(x1e * w)
-        py0, py1 = int(y0e * h), int(y1e * h)
-        if px1 <= px0 + 4 or py1 <= py0 + 4:
-            face_bgr = None
+        # Smooth bbox like ClearVoice medfilt(13) so TSE/TalkNet see a stable track.
+        cx_px = 0.5 * (x0 + x1) * w
+        cy_px = 0.5 * (y0 + y1) * h
+        half = max((x1 - x0) * w, (y1 - y0) * h) / 2.0
+        vec = np.array([cx_px, cy_px, half], dtype=np.float32)
+        if self._box_ema is None:
+            self._box_ema = vec
         else:
-            face_bgr = cv2.resize(
-                bgr[py0:py1, px0:px1].copy(), (224, 224), interpolation=cv2.INTER_AREA
-            )
+            self._box_ema = 0.65 * self._box_ema + 0.35 * vec
+        cx_s, cy_s, s_s = (float(v) for v in self._box_ema)
+        x0s = (cx_s - s_s) / max(w, 1)
+        x1s = (cx_s + s_s) / max(w, 1)
+        y0s = (cy_s - s_s) / max(h, 1)
+        y1s = (cy_s + s_s) / max(h, 1)
+        face_bgr = crop_face_clearvoice(bgr, x0s, y0s, x1s, y1s)
 
         up, lo = best[UPPER_LIP], best[LOWER_LIP]
         left, right = best[MOUTH_LEFT], best[MOUTH_RIGHT]
@@ -176,6 +240,8 @@ class FaceMouthTracker:
         now = time.time()
         audio_voice = (now - self._last_loud_at) < 0.55
         asd_score = 0.0
+        has_asd = False
+        talknet_speaking = False
         try:
             from app.asd import get_talknet, talknet_ready
 
@@ -183,15 +249,21 @@ class FaceMouthTracker:
                 net = get_talknet()
                 net.push_face(face_bgr)
                 asd_score = net.maybe_update(now)
+                has_asd = bool(getattr(net, "has_score", False))
+                talknet_speaking = bool(getattr(net, "speaking", False))
         except Exception:
             pass
-        # Open/moving mouth + mic energy. Hold through short gaps ("một... hai").
-        mouth_talking = bool(lip_active) or mouth_open >= 0.12
-        if mouth_talking and audio_voice:
+        # TalkNet on a webcam often stays <=0 during real speech (sync lag).
+        # A strong negative score still means the loud voice is someone else.
+        # Otherwise lips are enough to open the turn; audio stays continuous after that.
+        other_voice = has_asd and asd_score < -0.45 and not lip_active
+        if not frontal or other_voice:
+            self._speak_hold = 0
+        elif (lip_active or talknet_speaking) and audio_voice:
             self._speak_hold = 12
         elif self._speak_hold > 0:
             self._speak_hold -= 1
-        speaking = audio_voice and (mouth_talking or self._speak_hold > 0)
+        speaking = frontal and audio_voice and self._speak_hold > 0 and not other_voice
 
         return FaceCue(
             found=True,
@@ -205,6 +277,8 @@ class FaceMouthTracker:
             asd_score=asd_score,
             cx=cx,
             cy=cy,
+            frontal=frontal,
+            frontal_score=frontal_score,
             face_bgr=face_bgr,
         )
 
@@ -215,6 +289,7 @@ class FaceMouthTracker:
         self._speak_hold = 0
         self._prev_mouth = None
         self._prev_cheek = None
+        self._box_ema = None
 
     @staticmethod
     def _talk_activity(blends: dict[str, float], mouth_open: float) -> float:
@@ -268,9 +343,9 @@ class FaceMouthTracker:
         zc = _zero_crossings(hist[-14:])
         std = float(np.std(hist[-14:]))
         # Talking: periodic open/close. Still face / webcam jitter stays below this.
-        raw = (std >= 0.02 and zc >= 2) or (flow >= 0.4 and std >= 0.014)
+        raw = (std >= 0.012 and zc >= 2) or (flow >= 0.28 and std >= 0.01)
         if raw:
-            self._hold = 5
+            self._hold = 8
             return True
         if self._hold > 0:
             self._hold -= 1
@@ -283,7 +358,7 @@ _tracker: Optional[FaceMouthTracker] = None
 
 def get_tracker() -> FaceMouthTracker:
     global _tracker
-    if _tracker is None or not hasattr(_tracker, "_speak_hold"):
+    if _tracker is None or not hasattr(_tracker, "_box_ema"):
         if _tracker is not None:
             try:
                 _tracker.close()

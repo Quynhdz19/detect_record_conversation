@@ -17,6 +17,19 @@ def _to_pcm16(audio: np.ndarray) -> bytes:
     return (clipped * 32767.0).astype(np.int16).tobytes()
 
 
+def _is_target_extract(raw: np.ndarray, extracted: np.ndarray) -> bool:
+    """Keep TSE audio only if it still sounds like the on-camera speaker."""
+    if not looks_like_speech(extracted, SAMPLE_RATE):
+        return False
+    rs = speech_stats(raw, SAMPLE_RATE)
+    es = speech_stats(extracted, SAMPLE_RATE)
+    # Nearby talker: mixture loud, extract almost empty.
+    if rs["rms"] >= 0.015 and es["rms"] < 0.22 * rs["rms"] and es["voiced_ratio"] < 0.08:
+        logger.info("skip ASR: TSE suppressed other speaker raw=%s tse=%s", rs, es)
+        return False
+    return True
+
+
 def run_av_asr(
     pcm_bytes: bytes,
     face_crops: list,
@@ -36,14 +49,14 @@ def run_av_asr(
     if use_tse and face_crops:
         try:
             extracted = get_av_tse().extract(raw, face_crops)
-            if looks_like_speech(extracted, SAMPLE_RATE):
+            if _is_target_extract(raw, extracted):
                 audio = extracted
                 used_tse = True
             else:
                 logger.info(
                     "AV-TSE output failed VAD %s%s",
                     speech_stats(extracted, SAMPLE_RATE),
-                    "; using raw mic" if fallback_raw else "; skip (not this speaker)",
+                    "; using raw mic" if fallback_raw else "; skip (not opposite speaker)",
                 )
                 if not fallback_raw:
                     return "", False
@@ -85,7 +98,7 @@ def run_file_asr(audio_f32: np.ndarray, face_crops: list) -> tuple[str, bool, np
         try:
             extracted = get_av_tse().extract(audio, face_crops)
             extracted = np.clip(np.asarray(extracted, dtype=np.float32).reshape(-1), -1.0, 1.0)
-            if looks_like_speech(extracted, SAMPLE_RATE):
+            if looks_like_speech(extracted, SAMPLE_RATE) and _is_target_extract(audio, extracted):
                 audio = extracted
                 used_tse = True
             elif not looks_like_speech(audio, SAMPLE_RATE):

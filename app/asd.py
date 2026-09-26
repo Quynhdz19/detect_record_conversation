@@ -35,10 +35,10 @@ WEIGHT_URL = (
 VIS_FPS = 25
 MFCC_FPS = 100
 SAMPLE_RATE = 16000
-WINDOW_SEC = 0.8
-MIN_SEC = 0.64
-SCORE_EVERY = 0.15
-SPEAK_THRESH = 0.0  # paper default; -0.35 treated nearby talk as this face
+WINDOW_SEC = 1.2
+MIN_SEC = 0.8
+SCORE_EVERY = 0.12
+SPEAK_THRESH = 0.0  # TalkNet paper / TalkSet demo
 
 
 def pick_asd_device() -> str:
@@ -147,7 +147,7 @@ class TalkNetASD:
                 self.last_score = score
                 self.has_score = True
                 if score > SPEAK_THRESH:
-                    self._hold = 6
+                    self._hold = 8
                     self.speaking = True
                 elif self._hold > 0:
                     self._hold -= 1

@@ -11,18 +11,19 @@ import numpy as np
 from app.av_tse import SAMPLE_RATE
 from app.pipeline import run_av_asr
 
-# File upload works on a full clip. Live does the same on ~2.5s slices
-# only after there is actual voice, not continuous mic silence.
-MIN_FILE_SEC = 1.8
-HOP_SEC = 1.0
-MAX_UTTER_SEC = 8.0
-MAX_KEEP_SEC = 12.0
-SILENCE_FINAL_SEC = 1.4
-PRE_ROLL_SEC = 0.45
+# whisper_streaming keeps one continuous utterance (min chunk ~1s) and
+# endpoints on silence. faster-whisper pads pauses so Whisper is not fed
+# audio with the gaps between words cut out.
+MIN_FILE_SEC = 1.1
+HOP_SEC = 0.9
+MAX_UTTER_SEC = 12.0
+MAX_KEEP_SEC = 14.0
+SILENCE_FINAL_SEC = 0.7
+PRE_ROLL_SEC = 0.6
 VOICE_PEAK = 0.035
+TURN_ENERGY = 0.018
 MIN_VOICED_SEC = 0.12
-HANGOVER_SEC = 1.6
-COMMIT_OVERLAP_SEC = 1.0
+COMMIT_OVERLAP_SEC = 0.6
 
 
 @dataclass
@@ -41,30 +42,43 @@ class LiveStream:
     face_miss: int = 0
     voiced_sec: float = 0.0
     voiced_run_sec: float = 0.0
+    saw_target: bool = False
+    in_turn: bool = False
 
     def buf_sec(self) -> float:
         return len(self.buf) / (self.sr * 2)
 
-    def push_audio(self, pcm: bytes, now: float, *, voiced: bool = True) -> None:
+    def push_audio(
+        self,
+        pcm: bytes,
+        now: float,
+        *,
+        energy: bool = False,
+        target: bool = False,
+    ) -> None:
+        """Once the opposite face starts a turn, keep the waveform continuous.
+
+        Cutting each inter-word gap (old lip/TalkNet gate) is what made
+        normal-speed speech miss words. Endpointing waits for real silence.
+        """
         if not pcm:
             return
         self.last_audio_at = now
         chunk_sec = len(pcm) / (self.sr * 2)
-        if voiced:
+        if target:
+            self.saw_target = True
+            self.in_turn = True
+        if not self.in_turn:
+            self.buf.extend(pcm)
+            self.trim_to(PRE_ROLL_SEC)
+            return
+        self.buf.extend(pcm)
+        if energy:
+            self.last_voice_at = now
+            self.voiced_sec += chunk_sec
             self.voiced_run_sec = min(2.0, self.voiced_run_sec + chunk_sec)
         else:
             self.voiced_run_sec = max(0.0, self.voiced_run_sec - chunk_sec)
-        # Ignore isolated clicks; need a stretch of voice before opening an utterance.
-        commit_voice = voiced and self.voiced_run_sec >= MIN_VOICED_SEC
-        if commit_voice:
-            self.last_voice_at = now
-            self.voiced_sec += chunk_sec
-            self.buf.extend(pcm)
-        elif self.last_voice_at > 0:
-            self.buf.extend(pcm)
-        else:
-            self.buf.extend(pcm)
-            self.trim_to(PRE_ROLL_SEC)
         max_b = int(self.sr * MAX_KEEP_SEC) * 2
         if len(self.buf) > max_b:
             del self.buf[: len(self.buf) - max_b]
@@ -77,15 +91,15 @@ class LiveStream:
             return
         self.face_miss += 1
         self.last_crop = None
-        if self.face_miss >= 6 and not self.busy:
+        if self.face_miss >= 15 and not self.busy:
             self.discard()
 
     def push_crop(self, crop: Any) -> None:
         if crop is not None:
             self.last_crop = crop
             self.crops.append(crop)
-        if len(self.crops) > 96:
-            self.crops = self.crops[-96:]
+        if len(self.crops) > 90:
+            self.crops = self.crops[-90:]
 
     def snapshot(self) -> tuple[bytes, list[Any]]:
         return bytes(self.buf), list(self.crops)
@@ -94,7 +108,7 @@ class LiveStream:
         """End an utterance but keep a tail so words said during ASR are not wiped."""
         keep_b = int(self.sr * max(0.0, keep_sec)) * 2
         tail = bytes(self.buf[-keep_b:]) if keep_b and self.buf else b""
-        tail_crops = list(self.crops[-12:]) if keep_b and self.crops else []
+        tail_crops = list(self.crops[-25:]) if keep_b and self.crops else []
         last_v = self.last_voice_at
         last_crop = self.last_crop
         self.buf.clear()
@@ -104,14 +118,17 @@ class LiveStream:
         self.last_audio_at = 0.0
         self.face_miss = 0
         self.voiced_run_sec = 0.0
+        self.saw_target = False
+        self.in_turn = False
         if tail:
             self.buf.extend(tail)
             self.crops = tail_crops
             self.last_crop = last_crop
-            self.last_voice_at = last_v
             self.voiced_sec = min(self.voiced_sec, keep_sec)
             if last_v > 0 and (time.time() - last_v) < SILENCE_FINAL_SEC:
                 self.last_voice_at = last_v
+                self.in_turn = True
+                self.saw_target = True
             else:
                 self.last_voice_at = 0.0
         else:
@@ -152,7 +169,7 @@ class LiveStream:
             not self.busy
             and self.last_voice_at > 0
             and self.voiced_sec >= MIN_VOICED_SEC
-            and self.buf_sec() >= 1.2
+            and self.buf_sec() >= 0.8
             and (now - self.last_voice_at) >= SILENCE_FINAL_SEC
             and (now - self.last_decode_at) >= 0.45
         )
@@ -200,8 +217,9 @@ def audio_is_voiced(
         return True
     if speaking:
         return True
-    # Keep a started utterance through pauses between words/digits.
-    return last_voice_at > 0 and now > 0 and (now - last_voice_at) < HANGOVER_SEC
+    # Do not treat leftover room energy as this face. Hangover only
+    # appends a short tail in push_audio without refreshing last_voice_at.
+    return False
 
 
 def infer_window(
@@ -210,6 +228,7 @@ def infer_window(
     use_tse: bool = True,
     final: bool = False,
     allow_greetings: bool = False,
+    fallback_raw: bool = False,
 ) -> tuple[str, bool]:
     return run_av_asr(
         pcm,
@@ -217,5 +236,5 @@ def infer_window(
         use_tse=use_tse,
         final=final,
         allow_greetings=allow_greetings,
-        fallback_raw=True,
+        fallback_raw=fallback_raw,
     )

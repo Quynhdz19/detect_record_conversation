@@ -14,7 +14,7 @@
           <span class="mark"></span>
           <div>
             <h1>Detect Giọng Nói</h1>
-            <p>MP4 / Camera → AV-TSE tách giọng → PhoWhisper (VI)</p>
+            <p>Chỉ chuyển giọng người đối diện (nhìn camera) thành chữ</p>
           </div>
         </div>
         <div class="meta" id="meta">Đang kết nối server…</div>
@@ -51,7 +51,7 @@
 
           <label class="toggle">
             <input type="checkbox" id="requireSpeaking" checked />
-            Chỉ nhận khi môi đang cử động (tránh chữ nhảy lúc im)
+            Chỉ nhận giọng người đối diện (nhìn camera + đang nói)
           </label>
 
           <div class="level">
@@ -67,9 +67,8 @@
           </div>
 
           <ul class="tips">
-            <li>Live dùng cùng pipeline file: AV-TSE + PhoWhisper (~2s/lần)</li>
-            <li>AV-TSE: <code>AV_MossFormer2_TSE_16K</code></li>
-            <li>ASR: <code>vinai/PhoWhisper-small</code></li>
+            <li>Khóa người đối diện rồi giữ cả câu (không cắt giữa các từ) → AV-TSE → ASR</li>
+            <li>Nói tốc độ bình thường; ngừng ~0.7s thì chốt câu</li>
           </ul>
         </aside>
       </section>
@@ -128,6 +127,6 @@
         tick();
       })();
     </script>
-    <script src="/static/app.js?v=13"></script>
+    <script src="/static/app.js?v=16"></script>
   </body>
 </html>

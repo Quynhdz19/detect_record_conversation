@@ -20,6 +20,7 @@ VIDEO_FPS = 25
 SAMPLE_RATE = 16000
 VISUAL_MEAN = 0.4161
 VISUAL_STD = 0.1688
+DECODE_WINDOW_SEC = 3.0
 
 
 def _patch_clearvoice_mps() -> None:
@@ -88,17 +89,54 @@ class AVTargetSpeakerExtractor:
     def prepare_visual(
         self, face_crops_bgr: list[np.ndarray], n_audio_samples: int
     ) -> np.ndarray:
+        # Official evaluate_network: 25 fps, pad short tracks with edge.
         target_frames = max(1, int(round(n_audio_samples / SAMPLE_RATE * VIDEO_FPS)))
         if not face_crops_bgr:
-            # neutral face placeholder (zeros after normalize still ok-ish; prefer last)
             frames = [np.zeros((112, 112), dtype=np.float32)]
         else:
             frames = [self.face_bgr_to_visual_frame(f) for f in face_crops_bgr]
+        stacked = np.stack(frames, axis=0).astype(np.float32)
+        if stacked.shape[0] < target_frames:
+            stacked = np.pad(
+                stacked,
+                ((0, target_frames - stacked.shape[0]), (0, 0), (0, 0)),
+                mode="edge",
+            )
+        elif stacked.shape[0] > target_frames:
+            idx = np.linspace(0, stacked.shape[0] - 1, target_frames)
+            stacked = np.stack([stacked[int(round(i))] for i in idx], axis=0)
+        return stacked[np.newaxis, ...]
 
-        # Resample frame list to exact target length
-        idx = np.linspace(0, len(frames) - 1, target_frames)
-        visual = np.stack([frames[int(round(i))] for i in idx], axis=0)
-        return visual[np.newaxis, ...].astype(np.float32)  # [1, T, 112, 112]
+    def _decode_official(self, audio_b: np.ndarray, visual: np.ndarray) -> np.ndarray:
+        """Same sliding 3s window as clearvoice.utils.decode.decode_one_audio_AV_MossFormer2_TSE_16K."""
+        t = int(audio_b.shape[-1])
+        device = self.device
+        audio_t = torch.from_numpy(np.float32(audio_b)).to(device)
+        visual_t = torch.from_numpy(np.float32(visual)).to(device)
+        window = int(SAMPLE_RATE * DECODE_WINDOW_SEC)
+        window_v = int(VIDEO_FPS * DECODE_WINDOW_SEC)
+        if t <= window:
+            out = self.model(audio_t, visual_t).detach().float().cpu().numpy()
+            return np.squeeze(out)
+        outputs = np.zeros(t, dtype=np.float32)
+        stride = int(window * 0.6)
+        give_up = (window - stride) // 2
+        current = 0
+        while current + window < t:
+            tmp_a = audio_t[:, current : current + window]
+            idx_v = int(current / SAMPLE_RATE * VIDEO_FPS)
+            tmp_v = visual_t[:, idx_v : idx_v + window_v]
+            tmp = self.model(tmp_a, tmp_v).detach().squeeze().float().cpu().numpy()
+            if current == 0:
+                outputs[current : current + window - give_up] = tmp[:-give_up]
+            else:
+                outputs[current + give_up : current + window - give_up] = tmp[give_up:-give_up]
+            current += stride
+        tmp_a = audio_t[:, -window:]
+        tmp_v = visual_t[:, -window_v:]
+        tmp = self.model(tmp_a, tmp_v).detach().squeeze().float().cpu().numpy()
+        outputs[-window + give_up :] = tmp[give_up:]
+        return outputs
 
     @torch.inference_mode()
     def extract(
@@ -107,32 +145,25 @@ class AVTargetSpeakerExtractor:
         face_crops_bgr: list[np.ndarray],
     ) -> np.ndarray:
         audio = np.asarray(audio_f32, dtype=np.float32).reshape(-1)
-        if audio.size < SAMPLE_RATE:  # <1s
-            return audio
+        if audio.size < SAMPLE_RATE // 2:
+            return np.zeros_like(audio)
 
         peak = float(np.max(np.abs(audio))) + 1e-8
-        audio = audio / peak
-
-        visual = self.prepare_visual(face_crops_bgr, audio.shape[0])
-        audio_b = audio[np.newaxis, :]
-
-        # Prefer direct model call for short chunks (demo uses ~3s)
-        audio_t = torch.from_numpy(audio_b).to(self.device)
-        visual_t = torch.from_numpy(visual).to(self.device)
+        work = audio / peak
+        visual = self.prepare_visual(face_crops_bgr, work.shape[0])
+        audio_b = work[np.newaxis, :]
         try:
-            out = self.model(audio_t, visual_t).detach().float().cpu().numpy()
-            out = np.squeeze(out)
+            out = self._decode_official(audio_b, visual)
         except Exception:
-            logger.exception("AV-TSE model forward failed; falling back to mixture")
-            return (audio * peak).astype(np.float32)
+            logger.exception("AV-TSE model forward failed; returning silence")
+            return np.zeros_like(audio)
 
-        if out.ndim > 1:
-            out = out.reshape(-1)
-        # restore rough level
-        out = out.astype(np.float32)
+        out = np.asarray(out, dtype=np.float32).reshape(-1)
+        if out.size < audio.size:
+            out = np.pad(out, (0, audio.size - out.size))
+        out = out[: audio.size]
         out_peak = float(np.max(np.abs(out))) + 1e-8
-        out = out / out_peak * min(peak, 0.95)
-        return out
+        return out / out_peak * min(peak, 0.95)
 
 
 _extractor: Optional[AVTargetSpeakerExtractor] = None

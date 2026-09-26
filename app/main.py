@@ -22,7 +22,15 @@ from app.asr import (
     pick_device,
 )
 from app.av_tse import SAMPLE_RATE, get_av_tse
-from app.live import LiveStream, audio_is_voiced, infer_window, speaking_blocked
+from app.live import (
+    TURN_ENERGY,
+    VOICE_PEAK,
+    LiveStream,
+    MIN_FILE_SEC,
+    chunk_is_voiced,
+    infer_window,
+    speaking_blocked,
+)
 from app.pi_api import router as pi_router
 from app.video_pipeline import TMP_ROOT, process_mp4
 from app.vision import get_tracker
@@ -201,7 +209,9 @@ async def ws_session(websocket: WebSocket):
 
     def kick_decode(final: bool) -> None:
         # Never await ASR on the receive path — mic chunks must keep landing in the buffer.
-        if live.busy or live.buf_sec() < 1.2 or live.last_voice_at <= 0:
+        if live.busy or live.buf_sec() < MIN_FILE_SEC or live.last_voice_at <= 0:
+            return
+        if require_speaking and not live.saw_target:
             return
         live.busy = True
         live.last_decode_at = time.time()
@@ -212,11 +222,21 @@ async def ws_session(websocket: WebSocket):
             if not BOOT["asr_ready"]:
                 await websocket.send_json({"type": "status", "text": "ASR chưa sẵn sàng…"})
                 return
-            await websocket.send_json({"type": "status", "text": "AV-TSE + ASR…"})
+            await websocket.send_json({"type": "status", "text": "Tách giọng người đối diện…"})
             chunk, crops = live.snapshot()
             allow_greetings = final and live.last_voice_at > 0
+            # Buffer is already the confirmed turn, so raw is safe if TSE
+            # smears a single talker (common at normal speed, little overlap).
+            fallback_raw = (not require_speaking) or live.saw_target
             text, used_tse = await loop.run_in_executor(
-                None, infer_window, chunk, crops, True, final, allow_greetings
+                None,
+                infer_window,
+                chunk,
+                crops,
+                True,
+                final,
+                allow_greetings,
+                fallback_raw,
             )
             text = clean_transcript(text, final=final, allow_greetings=allow_greetings)
             if text:
@@ -304,6 +324,8 @@ async def ws_session(websocket: WebSocket):
                     "speaking": cue.speaking,
                     "lip_active": cue.lip_active,
                     "asd_score": getattr(cue, "asd_score", 0.0),
+                    "frontal": getattr(cue, "frontal", False),
+                    "frontal_score": getattr(cue, "frontal_score", 0.0),
                     "cx": cue.cx,
                     "cy": cue.cy,
                 }
@@ -317,15 +339,17 @@ async def ws_session(websocket: WebSocket):
 
             now = time.time()
             get_tracker().note_pcm16(payload, now)
-            voiced = audio_is_voiced(
-                payload,
-                speaking=bool(last_face.get("speaking")),
-                require_speaking=require_speaking,
-                face_found=bool(last_face.get("found")),
-                now=now,
-                last_voice_at=live.last_voice_at,
+            energy = chunk_is_voiced(payload, TURN_ENERGY)
+            target = (
+                require_speaking
+                and bool(last_face.get("found"))
+                and bool(last_face.get("frontal", True))
+                and bool(last_face.get("speaking") or last_face.get("lip_active"))
+                and chunk_is_voiced(payload, VOICE_PEAK)
             )
-            live.push_audio(payload, now, voiced=voiced)
+            if not require_speaking:
+                target = bool(last_face.get("found")) and energy
+            live.push_audio(payload, now, energy=energy or target, target=target)
             await maybe_decode()
 
     except WebSocketDisconnect:

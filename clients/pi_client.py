@@ -195,7 +195,7 @@ def main() -> None:
     p.add_argument("--session-id", default="", help="reconnect cùng hội thoại")
     p.add_argument("--token", default="")
     p.add_argument("--camera", type=int, default=0)
-    p.add_argument("--fps", type=float, default=12.0)
+    p.add_argument("--fps", type=float, default=25.0)
     p.add_argument("--jpeg-quality", type=int, default=70)
     p.add_argument("--reconnect", action="store_true", default=True)
     args = p.parse_args()
