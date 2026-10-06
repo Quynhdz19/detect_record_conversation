@@ -19,7 +19,6 @@ from fastapi.staticfiles import StaticFiles
 
 from app.asr import (
     MODEL_ID,
-    MicZipformer,
     clean_transcript,
     get_zipformer,
     looks_like_speech,
@@ -39,7 +38,8 @@ from app.live import (
 from app.pi_api import router as pi_router
 from app.video_pipeline import TMP_ROOT, process_mp4
 from app.vision import get_tracker
-from app.denoise import StreamDenoiser, denoise_pcm16
+from app.denoise import denoise_pcm16
+from app.duo import DuoMic
 from app.voice import assign_speaker, blend, embed_pcm16, get_extractor, match_voice
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -72,6 +72,8 @@ def _warm_models() -> None:
             logger.exception("Speaker embedding unavailable; A/B voice filter off")
         try:
             BOOT["stage"] = "loading GTCRN denoiser"
+            from app.denoise import StreamDenoiser
+
             StreamDenoiser()
         except Exception:
             logger.exception("Denoiser unavailable; stream stays noisy")
@@ -183,8 +185,7 @@ async def ws_session(websocket: WebSocket):
     await websocket.accept()
     sample_rate = SAMPLE_RATE
     live = LiveStream(sr=sample_rate)
-    mic = MicZipformer()
-    denoiser = StreamDenoiser()
+    duo = DuoMic()
     last_face: dict[str, Any] = {"found": False}
     require_speaking = True
     loop = asyncio.get_event_loop()
@@ -447,7 +448,7 @@ async def ws_session(websocket: WebSocket):
                         {"type": "config_ok", "require_speaking": require_speaking}
                     )
                 elif msg_type == "flush":
-                    for text, is_final in mic.flush():
+                    for text, is_final, speaker in duo.flush():
                         text = clean_transcript(text, final=is_final, allow_greetings=True)
                         if text:
                             await websocket.send_json(
@@ -456,7 +457,7 @@ async def ws_session(websocket: WebSocket):
                                     "text": text,
                                     "final": True,
                                     "used_tse": False,
-                                    "speaker": "",
+                                    "speaker": speaker,
                                 }
                             )
                 continue
@@ -474,12 +475,22 @@ async def ws_session(websocket: WebSocket):
             audio = np.frombuffer(payload, dtype=np.int16).astype(np.float32) / 32768.0
 
             def _hear(chunk: np.ndarray = audio) -> list:
-                return mic.accept(denoiser.accept(chunk))
+                return duo.accept(chunk)
 
             events = await loop.run_in_executor(None, _hear)
-            for text, is_final in events:
+            for text, is_final, speaker in events:
                 text = clean_transcript(text, final=is_final, allow_greetings=is_final)
                 if not text:
+                    if is_final and speaker:
+                        await websocket.send_json(
+                            {
+                                "type": "transcript",
+                                "text": "",
+                                "final": True,
+                                "used_tse": False,
+                                "speaker": speaker,
+                            }
+                        )
                     continue
                 await websocket.send_json(
                     {
@@ -487,7 +498,7 @@ async def ws_session(websocket: WebSocket):
                         "text": text,
                         "final": is_final,
                         "used_tse": False,
-                        "speaker": "",
+                        "speaker": speaker,
                     }
                 )
 

@@ -44,9 +44,15 @@
   function pushTranscript(text, final, usedTse, speaker) {
     if (!text || !String(text).trim()) return;
     const who = speaker ? speaker + ": " : "";
-    const body = String(text).trim();
+    const body = String(text || "").trim();
     const shown = who + body;
     const pending = "… " + who;
+    if (final && !body) {
+      const i = lines.findIndex((line) => line.startsWith(pending));
+      if (i >= 0) lines.splice(i, 1);
+      transcriptEl.textContent = lines.join("\n") || "(nói đi, chữ sẽ hiện ở đây)";
+      return;
+    }
     if (!final) {
       const i = lines.findIndex((line) => line.startsWith(pending));
       if (i >= 0) lines[i] = pending + body;
@@ -354,7 +360,7 @@
     flushBtn.disabled = false;
     if (frameTimer) clearInterval(frameTimer);
     frameTimer = null;
-    setBanner("Đang nghe. Tạp âm được lọc, chữ hiện trong lúc nói.", "ok");
+    setBanner("Đang nghe. Tạp âm được lọc. Chữ viết trên câu gốc.", "ok");
   }
 
   function stopAll() {
