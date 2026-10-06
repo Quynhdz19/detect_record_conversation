@@ -162,6 +162,7 @@ class FaceMouthTracker:
         self._box_ema: Optional[np.ndarray] = None
         self._tracks: list[dict] = []
         self.people: list[dict] = []
+        self.face_crops: dict = {}
 
     def close(self) -> None:
         self._landmarker.close()
@@ -203,6 +204,7 @@ class FaceMouthTracker:
         if not result.face_landmarks:
             self._reset_motion()
             self.people = []
+            self.face_crops = {}
             return FaceCue(found=False)
 
         observations = []
@@ -214,9 +216,10 @@ class FaceMouthTracker:
             area = max(1e-6, (x1 - x0) * (y1 - y0))
             observations.append((area, i, face, frontal_score, x0, y0, x1, y1))
         observations.sort(key=lambda item: item[0], reverse=True)
-        observations = observations[:2]
+        observations = observations[:3]
         if not observations:
             self.people = []
+            self.face_crops = {}
             return FaceCue(found=False)
 
         now = time.time()
@@ -234,7 +237,7 @@ class FaceMouthTracker:
                     best_t, best_d = track, dist
             if best_t is None:
                 used = {t["label"] for t in self._tracks}
-                label = "A" if "A" not in used else "B" if "B" not in used else ""
+                label = next((name for name in ("A", "B", "C") if name not in used), "")
                 if not label:
                     continue
                 best_t = {
@@ -330,6 +333,11 @@ class FaceMouthTracker:
             )
 
         self.people = people
+        self.face_crops = {
+            cue.speaker: cue.face_bgr
+            for cue in cues
+            if cue.speaker and cue.face_bgr is not None
+        }
         lippers = [c for c in cues if c.lip_active]
         if len(lippers) == 1:
             active = lippers[0]

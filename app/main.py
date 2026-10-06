@@ -7,6 +7,8 @@ import json
 import logging
 import threading
 import time
+
+import numpy as np
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -17,8 +19,11 @@ from fastapi.staticfiles import StaticFiles
 
 from app.asr import (
     MODEL_ID,
+    MicZipformer,
     clean_transcript,
     get_zipformer,
+    looks_like_speech,
+    pcm16_to_float32,
     pick_device,
 )
 from app.av_tse import SAMPLE_RATE, get_av_tse
@@ -34,7 +39,8 @@ from app.live import (
 from app.pi_api import router as pi_router
 from app.video_pipeline import TMP_ROOT, process_mp4
 from app.vision import get_tracker
-from app.voice import blend, embed_pcm16, get_extractor, match_voice
+from app.denoise import StreamDenoiser, denoise_pcm16
+from app.voice import assign_speaker, blend, embed_pcm16, get_extractor, match_voice
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -64,6 +70,11 @@ def _warm_models() -> None:
             get_extractor()
         except Exception:
             logger.exception("Speaker embedding unavailable; A/B voice filter off")
+        try:
+            BOOT["stage"] = "loading GTCRN denoiser"
+            StreamDenoiser()
+        except Exception:
+            logger.exception("Denoiser unavailable; stream stays noisy")
 
         BOOT["stage"] = "loading Face Landmarker"
         get_tracker()
@@ -172,6 +183,8 @@ async def ws_session(websocket: WebSocket):
     await websocket.accept()
     sample_rate = SAMPLE_RATE
     live = LiveStream(sr=sample_rate)
+    mic = MicZipformer()
+    denoiser = StreamDenoiser()
     last_face: dict[str, Any] = {"found": False}
     require_speaking = True
     loop = asyncio.get_event_loop()
@@ -211,6 +224,65 @@ async def ws_session(websocket: WebSocket):
         now = time.time()
         if live.should_emit_silence(now):
             await websocket.send_json({"type": "status", "text": "silence"})
+
+    def kick_lane(label: str, final: bool) -> None:
+        row = live.lanes.get(label)
+        if row is None or live.busy or row.busy:
+            return
+        if row.buf_sec() < (0.8 if final else MIN_FILE_SEC) or row.last_voice_at <= 0:
+            return
+        live.busy = True
+        row.busy = True
+        row.last_decode_at = time.time()
+        asyncio.create_task(process_lane(label, final))
+
+    async def process_lane(label: str, final: bool) -> None:
+        row = live.lanes.get(label)
+        try:
+            if row is None or not BOOT["asr_ready"]:
+                return
+            await websocket.send_json({"type": "status", "text": f"Tách giọng {label}…"})
+            chunk, _crops = row.snapshot()
+            # Voice lanes have no face crop. Transcribe the slice already assigned to this person.
+            text, used_tse = await loop.run_in_executor(
+                None,
+                infer_window,
+                chunk,
+                [],
+                False,
+                final,
+                final,
+                True,
+                False,
+            )
+            text = clean_transcript(text, final=final, allow_greetings=final)
+            if text and len(live.voiceprints) >= 2:
+                owner = await loop.run_in_executor(
+                    None, match_voice, chunk, dict(live.voiceprints)
+                )
+                if owner and owner != label:
+                    logger.info("drop %s subtitle; voice is %s", label, owner)
+                    text = ""
+            if text:
+                logger.info("subtitle %s final=%s %r", label, final, text)
+                await websocket.send_json(
+                    {
+                        "type": "transcript",
+                        "text": text,
+                        "final": final,
+                        "used_tse": used_tse,
+                        "speaker": label,
+                        "face": last_face,
+                    }
+                )
+            if final:
+                row.commit()
+        except Exception:
+            logger.exception("lane decode failed %s", label)
+        finally:
+            if row is not None:
+                row.busy = False
+            live.busy = False
 
     def kick_decode(final: bool) -> None:
         # Never await ASR on the receive path — mic chunks must keep landing in the buffer.
@@ -300,6 +372,37 @@ async def ws_session(websocket: WebSocket):
                 live.speaker = live.pending_speaker
             live.pending_speaker = ""
 
+    async def _route_voice(sample: bytes, now: float) -> None:
+        try:
+            try:
+                clean = await loop.run_in_executor(None, denoise_pcm16, sample)
+            except Exception:
+                logger.exception("denoise failed; using noisy audio")
+                clean = sample
+            audio = pcm16_to_float32(clean)
+            if not looks_like_speech(audio):
+                return
+            vec = await loop.run_in_executor(None, embed_pcm16, clean)
+            if vec is None:
+                return
+            label = assign_speaker(vec, live.voiceprints)
+            live.voiceprints[label] = blend(live.voiceprints.get(label), vec)
+            live.lane(label).push(clean, now, lips=True)
+            logger.info("routed audio to %s (%d voices)", label, len(live.voiceprints))
+            await websocket.send_json(
+                {
+                    "type": "voices",
+                    "labels": sorted(live.voiceprints),
+                    "active": label,
+                }
+            )
+            for who, is_final in live.due_lanes(time.time()):
+                kick_lane(who, is_final)
+        except Exception:
+            logger.exception("voice route failed")
+        finally:
+            live.enroll_busy = False
+
     async def _remember_voice(label: str, sample: bytes) -> None:
         try:
             vec = await loop.run_in_executor(None, embed_pcm16, sample)
@@ -344,7 +447,18 @@ async def ws_session(websocket: WebSocket):
                         {"type": "config_ok", "require_speaking": require_speaking}
                     )
                 elif msg_type == "flush":
-                    kick_decode(True)
+                    for text, is_final in mic.flush():
+                        text = clean_transcript(text, final=is_final, allow_greetings=True)
+                        if text:
+                            await websocket.send_json(
+                                {
+                                    "type": "transcript",
+                                    "text": text,
+                                    "final": True,
+                                    "used_tse": False,
+                                    "speaker": "",
+                                }
+                            )
                 continue
 
             raw = message.get("bytes")
@@ -352,74 +466,30 @@ async def ws_session(websocket: WebSocket):
                 continue
             tag, payload = raw[0], raw[1:]
 
-            if tag == 1:  # jpeg
-                if not BOOT["vision_ready"]:
-                    continue
-                cue = await loop.run_in_executor(None, get_tracker().analyze_jpeg, payload)
-                people = list(getattr(get_tracker(), "people", []))
-                last_face = {
-                    "found": cue.found,
-                    "x": cue.x,
-                    "y": cue.y,
-                    "w": cue.w,
-                    "h": cue.h,
-                    "mouth_open": cue.mouth_open,
-                    "speaking": cue.speaking,
-                    "lip_active": cue.lip_active,
-                    "asd_score": getattr(cue, "asd_score", 0.0),
-                    "frontal": getattr(cue, "frontal", False),
-                    "frontal_score": getattr(cue, "frontal_score", 0.0),
-                    "speaker": getattr(cue, "speaker", ""),
-                    "cx": cue.cx,
-                    "cy": cue.cy,
-                    "people": people,
-                    "voices": sorted(live.voiceprints),
-                }
-                if cue.lip_active and cue.speaking and cue.speaker:
-                    cut = live.take_turn_for(cue.speaker)
-                    if cut:
-                        prev, pcm_cut, crops_cut = cut
-                        live.busy = True
-                        live.last_decode_at = time.time()
-                        asyncio.create_task(process_chunk(True, prev, pcm_cut, crops_cut))
-                live.note_face(cue.face_bgr if cue.found else None, found=bool(cue.found))
-                await websocket.send_json({"type": "face", **last_face})
-                await maybe_decode()
+            if tag == 1:  # face check is off; camera frames are ignored
                 continue
-
             if tag != 2:
                 continue
 
-            now = time.time()
-            get_tracker().note_pcm16(payload, now)
-            energy = chunk_is_voiced(payload, TURN_ENERGY)
-            lips_now = bool(last_face.get("lip_active")) or any(
-                p.get("lip_active") for p in (last_face.get("people") or [])
-            )
-            # A turn starts only while the mouth is moving. Closed lips + fan/playback do not.
-            target = (
-                require_speaking
-                and bool(last_face.get("found"))
-                and bool(last_face.get("frontal", True))
-                and lips_now
-                and chunk_is_voiced(payload, VOICE_PEAK)
-            )
-            if not require_speaking:
-                target = bool(last_face.get("found")) and energy
-                lips_now = True
-            live.push_audio(payload, now, energy=energy, target=target, lips=lips_now)
-            # Learn a voice only from the mouth that is moving now, so B is not
-            # saved into A's profile while A's "still talking" hold is on.
-            lippers = [
-                p.get("speaker")
-                for p in (last_face.get("people") or [])
-                if p.get("lip_active") and p.get("speaker")
-            ]
-            if len(set(lippers)) == 1 and chunk_is_voiced(payload, VOICE_PEAK):
-                sample = live.push_enroll(lippers[0], payload)
-                if sample:
-                    asyncio.create_task(_remember_voice(lippers[0], sample))
-            await maybe_decode()
+            audio = np.frombuffer(payload, dtype=np.int16).astype(np.float32) / 32768.0
+
+            def _hear(chunk: np.ndarray = audio) -> list:
+                return mic.accept(denoiser.accept(chunk))
+
+            events = await loop.run_in_executor(None, _hear)
+            for text, is_final in events:
+                text = clean_transcript(text, final=is_final, allow_greetings=is_final)
+                if not text:
+                    continue
+                await websocket.send_json(
+                    {
+                        "type": "transcript",
+                        "text": text,
+                        "final": is_final,
+                        "used_tse": False,
+                        "speaker": "",
+                    }
+                )
 
     except WebSocketDisconnect:
         logger.info("Client disconnected")

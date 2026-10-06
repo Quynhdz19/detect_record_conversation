@@ -121,12 +121,91 @@ def get_zipformer():
     return rec
 
 
+_VAD_PATH = _ROOT / "checkpoints" / "silero_vad.onnx"
+_VAD_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
+
+
+def _ensure_silero_vad() -> Path:
+    if _VAD_PATH.exists() and _VAD_PATH.stat().st_size > 100_000:
+        return _VAD_PATH
+    logger.info("Downloading Silero VAD…")
+    _VAD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    urllib.request.urlretrieve(_VAD_URL, _VAD_PATH)
+    return _VAD_PATH
+
+
 def _zipformer_text(audio: np.ndarray, sample_rate: int) -> str:
     rec = get_zipformer()
     stream = rec.create_stream()
     stream.accept_waveform(sample_rate, np.ascontiguousarray(audio, dtype=np.float32))
     rec.decode_stream(stream)
     return (stream.result.text or "").strip().lower()
+
+
+class MicZipformer:
+    """sherpa-onnx mic path: Silero VAD + offline Zipformer-30M.
+
+    Same pattern as sherpa-onnx-vad-microphone-simulated-streaming-asr:
+    partial text while speech continues, final text when VAD endpoints.
+    """
+
+    def __init__(self) -> None:
+        import sherpa_onnx
+
+        config = sherpa_onnx.VadModelConfig()
+        config.silero_vad.model = str(_ensure_silero_vad())
+        config.silero_vad.threshold = 0.5
+        config.silero_vad.min_silence_duration = 0.5
+        config.silero_vad.min_speech_duration = 0.25
+        config.silero_vad.max_speech_duration = 15
+        config.sample_rate = 16000
+        config.provider = "cpu"
+        self._vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=30)
+        self._window = 512
+        self._pending = np.zeros(0, dtype=np.float32)
+        self._utt = np.zeros(0, dtype=np.float32)
+        self._since_partial = 0
+
+    def accept(self, audio: np.ndarray) -> list[tuple[str, bool]]:
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            return []
+        self._pending = np.concatenate([self._pending, audio])
+        events: list[tuple[str, bool]] = []
+        while self._pending.size >= self._window:
+            frame = np.ascontiguousarray(self._pending[: self._window])
+            self._pending = self._pending[self._window :]
+            self._vad.accept_waveform(frame)
+            if self._vad.is_speech_detected():
+                self._utt = np.concatenate([self._utt, frame])
+                self._since_partial += frame.size
+                if (
+                    self._since_partial >= 16000 * 0.4
+                    and self._utt.size >= int(16000 * 0.35)
+                ):
+                    text = _zipformer_text(self._utt, 16000)
+                    if text:
+                        events.append((text, False))
+                    self._since_partial = 0
+            while not self._vad.empty():
+                segment = np.array(self._vad.front.samples, dtype=np.float32)
+                self._vad.pop()
+                if segment.size >= int(16000 * 0.25):
+                    text = _zipformer_text(segment, 16000)
+                    if text:
+                        events.append((text, True))
+                self._utt = np.zeros(0, dtype=np.float32)
+                self._since_partial = 0
+        return events
+
+    def flush(self) -> list[tuple[str, bool]]:
+        if self._utt.size < int(16000 * 0.25):
+            self._utt = np.zeros(0, dtype=np.float32)
+            return []
+        text = _zipformer_text(self._utt, 16000)
+        self._utt = np.zeros(0, dtype=np.float32)
+        self._since_partial = 0
+        return [(text, True)] if text else []
 
 
 # Whisper invents these on silence / room noise

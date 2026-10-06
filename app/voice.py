@@ -78,6 +78,22 @@ def blend(previous: np.ndarray | None, new: np.ndarray, keep: float = 0.75) -> n
     return _unit(mixed)
 
 
+def assign_speaker(vec: np.ndarray, prints: dict[str, np.ndarray], threshold: float = 0.48) -> str:
+    """Map a voice vector onto A, B, or C. At most three people."""
+    names = ("A", "B", "C")
+    vec = _unit(vec)
+    if not prints:
+        return "A"
+    scores = {name: float(np.dot(vec, _unit(emb))) for name, emb in prints.items()}
+    best = max(scores, key=scores.get)
+    if scores[best] >= threshold or len(prints) >= 3:
+        logger.info("voice %s scores=%s", best, {k: round(v, 3) for k, v in scores.items()})
+        return best
+    label = next(name for name in names if name not in prints)
+    logger.info("new voice %s (best %s=%.3f)", label, best, scores[best])
+    return label
+
+
 def match_voice(pcm: bytes, prints: dict[str, np.ndarray], sample_rate: int = 16000) -> str:
     """Name whose enrolled voice this clip matches. Empty if only one voice or a tie."""
     if len(prints) < 2 or len(pcm) < sample_rate:

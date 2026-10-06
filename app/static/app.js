@@ -79,7 +79,7 @@
       ? face.people
       : face && face.found ? [face] : [];
     if (!w || !people.length) return;
-    const palette = { A: "#1f8f4e", B: "#2f6fed" };
+    const palette = { A: "#1f8f4e", B: "#2f6fed", C: "#c47b2b" };
     for (const person of people) {
       const color = palette[person.speaker] || "#f0c14b";
       const x = person.x * w;
@@ -179,7 +179,13 @@
         } catch (_) {
           return;
         }
-        if (msg.type === "ready") {
+        if (msg.type === "voices") {
+          const labels = msg.labels || [];
+          faceStatus.textContent = labels.length ? "Giọng " + labels.join(", ") : "Chưa có giọng";
+          speakStatus.textContent = msg.active ? "Đang lọc " + msg.active : "Đang nghe";
+          speakStatus.classList.toggle("hot", !!msg.active);
+          speakStatus.classList.toggle("muted", !msg.active);
+        } else if (msg.type === "ready") {
           setMeta(`${msg.av_tse_model} + ${msg.asr_model} · ${msg.device} · live`);
         } else if (msg.type === "face") {
           face = msg;
@@ -259,7 +265,6 @@
   }
 
   async function getMediaStream() {
-    // Try full constraints, then relax, then split audio/video
     const attempts = [
       {
         audio: {
@@ -268,10 +273,9 @@
           autoGainControl: false,
           channelCount: 1,
         },
-        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: false,
       },
-      { audio: true, video: { facingMode: "user" } },
-      { audio: true, video: true },
+      { audio: true, video: false },
     ];
 
     let lastErr = null;
@@ -282,59 +286,26 @@
         lastErr = err;
       }
     }
-
-    // Last resort: open separately
-    try {
-      const v = await navigator.mediaDevices.getUserMedia({ video: true });
-      try {
-        const a = await navigator.mediaDevices.getUserMedia({ audio: true });
-        a.getAudioTracks().forEach((t) => v.addTrack(t));
-      } catch (_) {
-        /* video-only fallback */
-      }
-      return v;
-    } catch (err) {
-      throw lastErr || err;
-    }
+    throw lastErr || new Error("Không mở được mic");
   }
 
   async function openMedia() {
     if (mediaOpen && stream && stream.active) return stream;
 
     if (!window.isSecureContext && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
-      throw new Error("Camera/mic cần http://127.0.0.1 hoặc https");
+      throw new Error("Mic cần http://127.0.0.1 hoặc https");
     }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      throw new Error("Trình duyệt không hỗ trợ camera/mic. Hãy mở bằng Chrome/Safari (không dùng Simple Browser).");
+      throw new Error("Trình duyệt không hỗ trợ mic. Hãy mở bằng Chrome/Safari.");
     }
 
-    setBanner("Đang xin quyền Camera + Microphone…");
+    setBanner("Đang xin quyền microphone…");
     stream = await getMediaStream();
 
-    const vTracks = stream.getVideoTracks();
     const aTracks = stream.getAudioTracks();
-    if (!vTracks.length && !aTracks.length) {
-      throw new Error("Không nhận được track camera/mic nào");
+    if (!aTracks.length) {
+      throw new Error("Không nhận được mic");
     }
-
-    video.srcObject = stream;
-    video.muted = true;
-    video.playsInline = true;
-    video.setAttribute("playsinline", "true");
-    video.setAttribute("webkit-playsinline", "true");
-    video.style.display = "block";
-    video.style.opacity = "1";
-    placeholder.style.display = "none";
-
-    try {
-      await video.play();
-    } catch (err) {
-      console.warn("video.play failed", err);
-    }
-
-    const okFrames = await waitForVideoFrames(3000);
-    resizeOverlay();
-    window.addEventListener("resize", resizeOverlay);
 
     // Audio graph: analyser for meter + script processor for streaming PCM
     if (aTracks.length) {
@@ -366,24 +337,8 @@
     listenBtn.disabled = false;
     stopBtn.disabled = false;
 
-    const vLabel = vTracks[0] ? vTracks[0].label || "camera" : "no-cam";
-    const aLabel = aTracks[0] ? aTracks[0].label || "mic" : "no-mic";
-    if (!okFrames && vTracks.length) {
-      setBanner(
-        "Đã cấp quyền nhưng <strong>không có khung hình camera</strong>. " +
-          "Hãy mở bằng <strong>Chrome/Safari thật</strong> tại <code>http://127.0.0.1:8000</code> " +
-          "(Simple Browser/IDE preview thường không chạy được webcam).<br/>" +
-          `Tracks: video=${vLabel} · audio=${aLabel}`,
-        "error"
-      );
-    } else {
-      setBanner(
-        `Camera/mic OK (${video.videoWidth || 0}×${video.videoHeight || 0}). ` +
-          `video=<code>${vLabel}</code> · mic=<code>${aLabel}</code>. ` +
-          `Bấm <strong>Bắt đầu nghe</strong> (hoặc đợi tự chạy).`,
-        "ok"
-      );
-    }
+    const aLabel = aTracks[0] ? aTracks[0].label || "mic" : "mic";
+    setBanner(`Mic OK: <code>${aLabel}</code>. Đang nghe.`, "ok");
     return stream;
   }
 
@@ -398,8 +353,8 @@
     listenBtn.disabled = true;
     flushBtn.disabled = false;
     if (frameTimer) clearInterval(frameTimer);
-    frameTimer = setInterval(sendVideoFrame, 40);
-    setBanner("Đang nghe người đối diện → Zipformer tiếng Việt.", "ok");
+    frameTimer = null;
+    setBanner("Đang nghe. Tạp âm được lọc, chữ hiện trong lúc nói.", "ok");
   }
 
   function stopAll() {
@@ -419,14 +374,14 @@
     processor = analyser = source = mute = audioCtx = stream = ws = null;
     video.srcObject = null;
     placeholder.style.display = "grid";
-    placeholder.textContent = "Camera chưa mở";
+    placeholder.textContent = "Mic chưa mở";
     ctx.clearRect(0, 0, overlay.width, overlay.height);
     startBtn.disabled = !window.__modelsReady;
     listenBtn.disabled = true;
     stopBtn.disabled = true;
     flushBtn.disabled = true;
     setMeta(window.__modelsReady ? "Đã dừng" : "Đang load model…");
-    setBanner("Đã dừng. Bấm <strong>Mở camera & mic</strong> để chạy lại.");
+    setBanner("Đã dừng. Bấm <strong>Mở mic và nghe</strong> để chạy lại.");
     faceStatus.textContent = "Chưa thấy mặt";
     speakStatus.textContent = "Miệng im";
     speakStatus.classList.add("muted");
@@ -445,10 +400,10 @@
       .catch((err) => {
         console.error(err);
         setBanner(
-          "Không mở được camera/mic: <code>" +
+          "Không mở được mic: <code>" +
             (err && err.name ? err.name + ": " : "") +
             (err && err.message ? err.message : err) +
-            "</code><br/>Mở bằng Chrome/Safari: <code>http://127.0.0.1:8000</code> và Allow Camera + Microphone.",
+            "</code><br/>Mở bằng Chrome/Safari: <code>http://127.0.0.1:8001</code> và cho phép Microphone.",
           "error"
         );
       });

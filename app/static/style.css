@@ -103,6 +103,15 @@ html, body {
   gap: 18px;
 }
 
+.stage:has(.video-wrap[hidden]) {
+  grid-template-columns: minmax(0, 720px);
+}
+
+.video-wrap[hidden],
+.toggle[hidden] {
+  display: none !important;
+}
+
 .video-wrap {
   position: relative;
   border-radius: 22px;

@@ -14,8 +14,8 @@ from app.pipeline import run_av_asr
 # whisper_streaming keeps one continuous utterance (min chunk ~1s) and
 # endpoints on silence. faster-whisper pads pauses so Whisper is not fed
 # audio with the gaps between words cut out.
-MIN_FILE_SEC = 1.1
-HOP_SEC = 0.9
+MIN_FILE_SEC = 0.45
+HOP_SEC = 0.4
 MAX_UTTER_SEC = 12.0
 MAX_KEEP_SEC = 14.0
 SILENCE_FINAL_SEC = 0.7
@@ -24,6 +24,100 @@ VOICE_PEAK = 0.035
 TURN_ENERGY = 0.018
 MIN_VOICED_SEC = 0.12
 COMMIT_OVERLAP_SEC = 0.6
+
+
+@dataclass
+class SpeakerLane:
+    """One person's rolling mic slice. Lips of this face decide what enters."""
+
+    label: str
+    sr: int = SAMPLE_RATE
+    buf: bytearray = field(default_factory=bytearray)
+    crops: list[Any] = field(default_factory=list)
+    last_crop: Any = None
+    last_lips_at: float = 0.0
+    last_voice_at: float = 0.0
+    last_decode_at: float = 0.0
+    in_turn: bool = False
+    busy: bool = False
+    voiced_sec: float = 0.0
+    snap_len: int = 0
+
+    def buf_sec(self) -> float:
+        return len(self.buf) / (self.sr * 2)
+
+    def push(self, pcm: bytes, now: float, *, lips: bool, crop: Any = None) -> None:
+        if not pcm:
+            return
+        chunk_sec = len(pcm) / (self.sr * 2)
+        if lips:
+            self.last_lips_at = now
+            self.last_voice_at = now
+            self.in_turn = True
+            self.voiced_sec += chunk_sec
+        recent = self.last_lips_at > 0 and (now - self.last_lips_at) < 0.4
+        if not self.in_turn or not recent:
+            return
+        self.buf.extend(pcm)
+        if crop is not None:
+            self.last_crop = crop
+            self.crops.append(crop)
+            if len(self.crops) > 48:
+                self.crops = self.crops[-48:]
+        max_b = int(self.sr * MAX_KEEP_SEC) * 2
+        if len(self.buf) > max_b:
+            del self.buf[: len(self.buf) - max_b]
+
+    def snapshot(self) -> tuple[bytes, list[Any]]:
+        self.snap_len = len(self.buf)
+        return bytes(self.buf), list(self.crops)
+
+    def commit(self) -> None:
+        arrived = b""
+        if self.snap_len and len(self.buf) > self.snap_len:
+            arrived = bytes(self.buf[self.snap_len :])
+            cap = int(self.sr * 2.5) * 2
+            if len(arrived) > cap:
+                arrived = arrived[-cap:]
+        lips_fresh = self.last_lips_at > 0 and (time.time() - self.last_lips_at) < 0.5
+        tail = arrived if arrived and lips_fresh else b""
+        tail_crops = list(self.crops[-12:]) if tail else []
+        last_v = self.last_voice_at
+        self.buf.clear()
+        self.crops.clear()
+        self.voiced_sec = 0.0
+        self.in_turn = False
+        self.snap_len = 0
+        if tail:
+            self.buf.extend(tail)
+            self.crops = tail_crops
+            if last_v > 0 and (time.time() - last_v) < SILENCE_FINAL_SEC:
+                self.last_voice_at = last_v
+                self.in_turn = True
+                self.voiced_sec = len(tail) / (self.sr * 2)
+            else:
+                self.last_voice_at = 0.0
+        else:
+            self.last_voice_at = 0.0
+
+    def want_partial(self, now: float) -> bool:
+        return (
+            not self.busy
+            and self.in_turn
+            and self.voiced_sec >= MIN_VOICED_SEC
+            and self.buf_sec() >= MIN_FILE_SEC
+            and (now - self.last_decode_at) >= HOP_SEC
+        )
+
+    def want_final(self, now: float) -> bool:
+        return (
+            not self.busy
+            and self.last_voice_at > 0
+            and self.voiced_sec >= MIN_VOICED_SEC
+            and self.buf_sec() >= 0.35
+            and (now - self.last_voice_at) >= SILENCE_FINAL_SEC
+            and (now - self.last_decode_at) >= 0.35
+        )
 
 
 @dataclass
@@ -52,6 +146,56 @@ class LiveStream:
     enroll_buf: dict = field(default_factory=dict)
     enroll_new: dict = field(default_factory=dict)
     enroll_busy: bool = False
+    lanes: dict = field(default_factory=dict)
+    latest_crops: dict = field(default_factory=dict)
+    mix: bytearray = field(default_factory=bytearray)
+    mix_voice_at: float = 0.0
+
+    def collect_speech(self, pcm: bytes, now: float, *, energy: bool) -> bytes | None:
+        """Buffer mic audio until ~1s of voice, or a short phrase just ended."""
+        if energy and pcm:
+            self.mix.extend(pcm)
+            self.mix_voice_at = now
+            max_b = self.sr * 4 * 2
+            if len(self.mix) > max_b:
+                del self.mix[: len(self.mix) - max_b]
+        if self.enroll_busy or not self.mix:
+            return None
+        enough = len(self.mix) >= int(self.sr * 0.45) * 2
+        ended = (
+            self.mix_voice_at > 0
+            and (now - self.mix_voice_at) > 0.55
+            and len(self.mix) >= int(self.sr * 0.35) * 2
+        )
+        if not enough and not ended:
+            return None
+        sample = bytes(self.mix)
+        self.mix.clear()
+        self.enroll_busy = True
+        return sample
+
+    def lane(self, label: str) -> SpeakerLane:
+        row = self.lanes.get(label)
+        if row is None:
+            row = SpeakerLane(label=label, sr=self.sr)
+            self.lanes[label] = row
+        return row
+
+    def push_speakers(self, pcm: bytes, now: float, active: set[str], crops: dict) -> None:
+        labels = set(self.lanes) | set(active)
+        for label in labels:
+            self.lane(label).push(pcm, now, lips=label in active, crop=crops.get(label))
+
+    def due_lanes(self, now: float) -> list[tuple[str, bool]]:
+        if self.busy:
+            return []
+        finals = [row.label for row in self.lanes.values() if row.want_final(now)]
+        if finals:
+            return [(finals[0], True)]
+        partials = [row.label for row in self.lanes.values() if row.want_partial(now)]
+        if partials:
+            return [(partials[0], False)]
+        return []
 
     def push_enroll(self, label: str, pcm: bytes) -> bytes | None:
         """Collect a clean clip of one person. Returns audio once there is enough to embed."""
