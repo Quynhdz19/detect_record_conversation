@@ -44,6 +44,7 @@ from app.voice import assign_speaker, blend, embed_pcm16, get_extractor, match_v
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+_face_lock = threading.Lock()
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -186,7 +187,8 @@ async def ws_session(websocket: WebSocket):
     sample_rate = SAMPLE_RATE
     live = LiveStream(sr=sample_rate)
     duo = DuoMic()
-    last_face: dict[str, Any] = {"found": False}
+    last_face: dict[str, Any] = {"found": False, "lip_active": False}
+    last_lip_at = 0.0
     require_speaking = True
     loop = asyncio.get_event_loop()
 
@@ -467,14 +469,54 @@ async def ws_session(websocket: WebSocket):
                 continue
             tag, payload = raw[0], raw[1:]
 
-            if tag == 1:  # face check is off; camera frames are ignored
+            if tag == 1:
+                def _see(jpeg: bytes = payload):
+                    with _face_lock:
+                        return get_tracker().analyze_jpeg(jpeg)
+
+                try:
+                    cue = await loop.run_in_executor(None, _see)
+                except Exception:
+                    logger.exception("face frame failed")
+                    continue
+                if cue.lip_active:
+                    last_lip_at = time.time()
+                last_face = {
+                    "found": bool(cue.found),
+                    "lip_active": bool(cue.lip_active),
+                    "speaking": bool(cue.lip_active),
+                    "x": cue.x,
+                    "y": cue.y,
+                    "w": cue.w,
+                    "h": cue.h,
+                    "speaker": cue.speaker or "",
+                }
+                people = []
+                for person in get_tracker().people:
+                    people.append(
+                        {
+                            "speaker": person.get("speaker") or "",
+                            "x": person.get("x", 0),
+                            "y": person.get("y", 0),
+                            "w": person.get("w", 0),
+                            "h": person.get("h", 0),
+                            "speaking": bool(person.get("lip_active")),
+                            "lip_active": bool(person.get("lip_active")),
+                            "frontal": bool(person.get("frontal", True)),
+                        }
+                    )
+                await websocket.send_json(
+                    {"type": "face", "people": people, **last_face}
+                )
                 continue
             if tag != 2:
                 continue
 
             audio = np.frombuffer(payload, dtype=np.int16).astype(np.float32) / 32768.0
+            mouth_open = last_lip_at > 0 and (time.time() - last_lip_at) < 0.5
+            heard = audio if mouth_open else np.zeros_like(audio)
 
-            def _hear(chunk: np.ndarray = audio) -> list:
+            def _hear(chunk: np.ndarray = heard) -> list:
                 return duo.accept(chunk)
 
             events = await loop.run_in_executor(None, _hear)

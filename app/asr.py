@@ -114,7 +114,7 @@ def get_zipformer():
         sample_rate=16000,
         feature_dim=80,
         decoding_method="modified_beam_search",
-        max_active_paths=4,
+        max_active_paths=8,
         provider="cpu",
     )
     logger.info("Zipformer ready.")

@@ -42,7 +42,6 @@
   }
 
   function pushTranscript(text, final, usedTse, speaker) {
-    if (!text || !String(text).trim()) return;
     const who = speaker ? speaker + ": " : "";
     const body = String(text || "").trim();
     const shown = who + body;
@@ -53,6 +52,7 @@
       transcriptEl.textContent = lines.join("\n") || "(nói đi, chữ sẽ hiện ở đây)";
       return;
     }
+    if (!body) return;
     if (!final) {
       const i = lines.findIndex((line) => line.startsWith(pending));
       if (i >= 0) lines[i] = pending + body;
@@ -279,9 +279,12 @@
           autoGainControl: false,
           channelCount: 1,
         },
-        video: false,
+        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
       },
-      { audio: true, video: false },
+      {
+        audio: true,
+        video: { facingMode: "user" },
+      },
     ];
 
     let lastErr = null;
@@ -305,9 +308,18 @@
       throw new Error("Trình duyệt không hỗ trợ mic. Hãy mở bằng Chrome/Safari.");
     }
 
-    setBanner("Đang xin quyền microphone…");
+    setBanner("Đang xin quyền camera và mic…");
     stream = await getMediaStream();
 
+    const vTracks = stream.getVideoTracks();
+    if (!vTracks.length) {
+      throw new Error("Không nhận được camera");
+    }
+    video.srcObject = stream;
+    video.muted = true;
+    video.controls = false;
+    await video.play();
+    placeholder.style.display = "none";
     const aTracks = stream.getAudioTracks();
     if (!aTracks.length) {
       throw new Error("Không nhận được mic");
@@ -344,7 +356,7 @@
     stopBtn.disabled = false;
 
     const aLabel = aTracks[0] ? aTracks[0].label || "mic" : "mic";
-    setBanner(`Mic OK: <code>${aLabel}</code>. Đang nghe.`, "ok");
+    setBanner(`Camera và mic đã mở: <code>${aLabel}</code>.`, "ok");
     return stream;
   }
 
@@ -359,8 +371,10 @@
     listenBtn.disabled = true;
     flushBtn.disabled = false;
     if (frameTimer) clearInterval(frameTimer);
-    frameTimer = null;
-    setBanner("Đang nghe. Tạp âm được lọc. Chữ viết trên câu gốc.", "ok");
+    frameTimer = setInterval(() => {
+      sendVideoFrame().catch(() => {});
+    }, 125);
+    setBanner("Nhìn camera. Môi động thì chữ mới hiện.", "ok");
   }
 
   function stopAll() {
@@ -387,7 +401,7 @@
     stopBtn.disabled = true;
     flushBtn.disabled = true;
     setMeta(window.__modelsReady ? "Đã dừng" : "Đang load model…");
-    setBanner("Đã dừng. Bấm <strong>Mở mic và nghe</strong> để chạy lại.");
+    setBanner("Đã dừng. Bấm <strong>Mở camera và mic</strong> để chạy lại.");
     faceStatus.textContent = "Chưa thấy mặt";
     speakStatus.textContent = "Miệng im";
     speakStatus.classList.add("muted");

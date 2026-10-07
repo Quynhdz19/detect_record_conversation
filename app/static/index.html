@@ -14,7 +14,7 @@
           <span class="mark"></span>
           <div>
             <h1>Detect Giọng Nói</h1>
-            <p>Mic → lọc tạp âm → chữ</p>
+            <p>Môi động → mic viết chữ</p>
           </div>
         </div>
         <div class="meta" id="meta">Đang kết nối server…</div>
@@ -23,7 +23,7 @@
       <div id="banner" class="banner">Đang kiểm tra model…</div>
 
       <section class="stage">
-        <div class="video-wrap" hidden>
+        <div class="video-wrap">
           <div id="videoPlaceholder" class="placeholder">Chọn MP4 hoặc mở camera</div>
           <video id="video" playsinline controls muted></video>
           <canvas id="overlay"></canvas>
@@ -43,7 +43,7 @@
           </div>
 
           <div class="controls">
-            <button id="startBtn" class="primary alt" disabled>Mở mic và nghe</button>
+            <button id="startBtn" class="primary alt" disabled>Mở camera và mic</button>
             <button id="listenBtn" class="ghost" disabled>Bắt đầu nghe</button>
             <button id="stopBtn" class="ghost" disabled>Dừng</button>
             <button id="flushBtn" class="ghost" disabled>Chốt câu</button>
@@ -82,7 +82,7 @@
           if (h.ready) {
             meta.textContent = (h.av_tse_model || "AV-TSE") + " + " + (h.asr_model || "ASR") + " · " + (h.device || "");
             banner.className = "banner ok";
-            banner.innerHTML = "Model sẵn sàng. Bấm <strong>Mở mic và nghe</strong>.";
+            banner.innerHTML = "Model sẵn sàng. Bấm <strong>Mở camera và mic</strong>.";
             startBtn.disabled = false;
             processVideoBtn.disabled = false;
             window.__modelsReady = true;
@@ -123,6 +123,6 @@
         tick();
       })();
     </script>
-    <script src="/static/app.js?v=27"></script>
+    <script src="/static/app.js?v=29"></script>
   </body>
 </html>
