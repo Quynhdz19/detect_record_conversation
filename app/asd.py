@@ -99,7 +99,7 @@ class TalkNetASD:
         self.device = pick_asd_device()
         self.bundle = _load_bundle(self.device)
         self._lock = threading.Lock()
-        self._faces: deque[np.ndarray] = deque(maxlen=int(VIS_FPS * 3))
+        self._faces: deque[tuple[float, np.ndarray]] = deque(maxlen=int(VIS_FPS * 3))
         self._pcm = bytearray()
         self._last_infer = 0.0
         self._infer_busy = False
@@ -113,7 +113,7 @@ class TalkNetASD:
         if face_bgr is None or face_bgr.size == 0:
             return
         with self._lock:
-            self._faces.append(_face_to_112(face_bgr))
+            self._faces.append((time.time(), _face_to_112(face_bgr)))
 
     def push_pcm16(self, pcm: bytes) -> None:
         if not pcm:
@@ -129,11 +129,11 @@ class TalkNetASD:
         with self._lock:
             if self._infer_busy or t - self._last_infer < SCORE_EVERY:
                 return self.last_score
-            n_face = len(self._faces)
+            # Faces must cover the same 1.2 s as the audio window, or lips and sound misalign.
+            faces = [face for ts, face in self._faces if t - ts <= WINDOW_SEC]
             pcm_sec = len(self._pcm) / (SAMPLE_RATE * 2)
-            if n_face < 8 or pcm_sec < MIN_SEC:
+            if len(faces) < 6 or pcm_sec < MIN_SEC:
                 return self.last_score
-            faces = list(self._faces)
             pcm = bytes(self._pcm)
             self._last_infer = t
             self._infer_busy = True
@@ -147,7 +147,7 @@ class TalkNetASD:
                 self.last_score = score
                 self.has_score = True
                 if score > SPEAK_THRESH:
-                    self._hold = 8
+                    self._hold = 4
                     self.speaking = True
                 elif self._hold > 0:
                     self._hold -= 1

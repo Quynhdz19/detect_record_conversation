@@ -215,9 +215,11 @@
           } else if (voices.length === 1) {
             speakStatus.textContent = "Đã nhớ giọng " + voices[0];
           } else if (msg.lip_active) {
-            speakStatus.textContent = "Môi nhúc";
+            speakStatus.textContent = "Môi đang nói";
+          } else if (msg.found) {
+            speakStatus.textContent = "Miệng im";
           } else {
-            speakStatus.textContent = "Không nói";
+            speakStatus.textContent = "Chưa thấy miệng";
           }
           speakStatus.classList.toggle("hot", !!msg.speaking);
           speakStatus.classList.toggle("muted", !msg.speaking);

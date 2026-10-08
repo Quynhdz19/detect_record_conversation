@@ -338,15 +338,8 @@ class FaceMouthTracker:
             for cue in cues
             if cue.speaker and cue.face_bgr is not None
         }
-        lippers = [c for c in cues if c.lip_active]
-        if len(lippers) == 1:
-            active = lippers[0]
-        else:
-            talkers = [c for c in cues if c.speaking]
-            if talkers:
-                active = max(talkers, key=lambda c: c.mouth_open)
-            else:
-                active = max(cues, key=lambda c: c.w * c.h)
+        # The script follows the person facing the camera, not a side face whose lips move.
+        active = max(cues, key=lambda c: c.frontal_score * c.w * c.h)
         if active.face_bgr is not None:
             try:
                 from app.asd import get_talknet, talknet_ready

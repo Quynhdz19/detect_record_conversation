@@ -47,6 +47,18 @@ logger = logging.getLogger(__name__)
 _face_lock = threading.Lock()
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+# TalkNet needs ~1 s of lips before it confirms speech; keep that audio so the first word survives.
+PREROLL_SEC = 1.0
+
+
+def _talknet_says_speaking() -> bool:
+    """Lips must match the sound. A still face next to a TV scores below zero."""
+    from app.asd import get_talknet, talknet_ready
+
+    if not talknet_ready():
+        return False
+    net = get_talknet()
+    return bool(net.has_score and net.speaking)
 
 # Shared boot status so UI can poll without blocking server start
 BOOT: dict[str, Any] = {
@@ -189,6 +201,8 @@ async def ws_session(websocket: WebSocket):
     duo = DuoMic()
     last_face: dict[str, Any] = {"found": False, "lip_active": False}
     last_lip_at = 0.0
+    mouth_open = False
+    preroll: list[np.ndarray] = []
     require_speaking = True
     loop = asyncio.get_event_loop()
 
@@ -479,12 +493,15 @@ async def ws_session(websocket: WebSocket):
                 except Exception:
                     logger.exception("face frame failed")
                     continue
-                if cue.lip_active:
+                synced = _talknet_says_speaking()
+                talking = bool(cue.found and cue.lip_active and synced)
+                if talking:
                     last_lip_at = time.time()
                 last_face = {
                     "found": bool(cue.found),
-                    "lip_active": bool(cue.lip_active),
-                    "speaking": bool(cue.lip_active),
+                    "lip_active": talking,
+                    "speaking": talking,
+                    "asd_score": round(float(cue.asd_score), 2),
                     "x": cue.x,
                     "y": cue.y,
                     "w": cue.w,
@@ -513,24 +530,44 @@ async def ws_session(websocket: WebSocket):
                 continue
 
             audio = np.frombuffer(payload, dtype=np.int16).astype(np.float32) / 32768.0
-            mouth_open = last_lip_at > 0 and (time.time() - last_lip_at) < 0.5
-            heard = audio if mouth_open else np.zeros_like(audio)
+            try:
+                get_tracker().note_pcm16(payload)
+            except Exception:
+                logger.exception("TalkNet audio feed failed")
+            # Only the mouth in frame may open the mic. A closed mouth drops the sound.
+            lips_now = last_lip_at > 0 and (time.time() - last_lip_at) < 0.45
+            if lips_now:
+                if not mouth_open:
+                    logger.info("mouth gate open (asd=%.2f)", last_face.get("asd_score", 0.0))
+                    head = preroll + [audio]
+                    audio = np.concatenate(head)
+                mouth_open = True
+                preroll = []
 
-            def _hear(chunk: np.ndarray = heard) -> list:
-                return duo.accept(chunk)
+                def _hear(chunk: np.ndarray = audio) -> list:
+                    return duo.accept(chunk)
 
-            events = await loop.run_in_executor(None, _hear)
-            for text, is_final, speaker in events:
+                events = await loop.run_in_executor(None, _hear)
+            elif mouth_open:
+                mouth_open = False
+                logger.info("mouth gate closed")
+                events = await loop.run_in_executor(None, duo.flush)
+            else:
+                preroll.append(audio)
+                while sum(p.size for p in preroll) > int(SAMPLE_RATE * PREROLL_SEC):
+                    preroll.pop(0)
+                continue
+            for text, is_final, _speaker in events:
                 text = clean_transcript(text, final=is_final, allow_greetings=is_final)
                 if not text:
-                    if is_final and speaker:
+                    if is_final:
                         await websocket.send_json(
                             {
                                 "type": "transcript",
                                 "text": "",
                                 "final": True,
                                 "used_tse": False,
-                                "speaker": speaker,
+                                "speaker": "",
                             }
                         )
                     continue
@@ -540,7 +577,7 @@ async def ws_session(websocket: WebSocket):
                         "text": text,
                         "final": is_final,
                         "used_tse": False,
-                        "speaker": speaker,
+                        "speaker": "",
                     }
                 )
 
