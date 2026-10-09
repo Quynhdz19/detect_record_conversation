@@ -39,7 +39,7 @@ from app.pi_api import router as pi_router
 from app.video_pipeline import TMP_ROOT, process_mp4
 from app.vision import get_tracker
 from app.denoise import denoise_pcm16
-from app.duo import DuoMic
+from app.duo import OWNER_ENROLL_SEC, DuoMic
 from app.voice import assign_speaker, blend, embed_pcm16, get_extractor, match_voice
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -199,6 +199,7 @@ async def ws_session(websocket: WebSocket):
     sample_rate = SAMPLE_RATE
     live = LiveStream(sr=sample_rate)
     duo = DuoMic()
+    owner_shown: tuple[bool, int] | None = None
     last_face: dict[str, Any] = {"found": False, "lip_active": False}
     last_lip_at = 0.0
     mouth_open = False
@@ -476,6 +477,9 @@ async def ws_session(websocket: WebSocket):
                                     "speaker": speaker,
                                 }
                             )
+                elif msg_type == "reset_owner":
+                    duo.reset_owner()
+                    owner_shown = None
                 continue
 
             raw = message.get("bytes")
@@ -557,6 +561,15 @@ async def ws_session(websocket: WebSocket):
                 while sum(p.size for p in preroll) > int(SAMPLE_RATE * PREROLL_SEC):
                     preroll.pop(0)
                 continue
+            owner_now = (duo.owner_ready, round(duo.owner_sec))
+            if owner_now != owner_shown:
+                owner_shown = owner_now
+                label = (
+                    "Giọng đã đăng ký: chỉ nhận người này"
+                    if duo.owner_ready
+                    else f"Đang đăng ký giọng {duo.owner_sec:.0f}/{OWNER_ENROLL_SEC:.0f}s"
+                )
+                await websocket.send_json({"type": "status", "text": label})
             for text, is_final, _speaker in events:
                 text = clean_transcript(text, final=is_final, allow_greetings=is_final)
                 if not text:

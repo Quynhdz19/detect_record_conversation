@@ -9,6 +9,7 @@ the previous person instead of flipping A and B.
 from __future__ import annotations
 
 import logging
+import os
 
 import numpy as np
 
@@ -26,6 +27,12 @@ NEW_VOICE = 0.30
 SWITCH_MARGIN = 0.06
 # Only fold a clip into a voiceprint when it clearly is that person.
 ENROLL_SCORE = 0.50
+# The owner is whoever speaks through the lip gate first; this much of their speech builds the filter.
+OWNER_ENROLL_SEC = float(os.environ.get("OWNER_ENROLL_SEC", "4.0"))
+OWNER_CLIP_SEC = 1.5
+# On repo samples the same speaker scored 0.46–0.85 on 1.2 s clips, other speakers 0.02–0.27.
+OWNER_MIN = float(os.environ.get("OWNER_MIN", "0.40"))
+OWNER_ADAPT = 0.60
 
 
 class DuoMic:
@@ -51,6 +58,42 @@ class DuoMic:
         self._shown = ""
         self._last = "A"
         self.prints: dict[str, np.ndarray] = {}
+        self.owner: np.ndarray | None = None
+        self.owner_sec = 0.0
+        self._utt_rejected = False
+
+    @property
+    def owner_ready(self) -> bool:
+        return self.owner is not None and self.owner_sec >= OWNER_ENROLL_SEC
+
+    def reset_owner(self) -> None:
+        self.owner = None
+        self.owner_sec = 0.0
+
+    def _owner_allows(self, vec: np.ndarray | None, n_samples: int, final: bool) -> bool:
+        """Enroll the first lip-gated speaker, then only let that voice through."""
+        sec = n_samples / SR
+        if not self.owner_ready:
+            if final and vec is not None and sec >= OWNER_CLIP_SEC:
+                if self.owner is not None and float(np.dot(vec, self.owner)) < ENROLL_SCORE:
+                    logger.info("owner enroll skip score=%.3f", float(np.dot(vec, self.owner)))
+                else:
+                    w = sec / (self.owner_sec + sec)
+                    self.owner = vec if self.owner is None else blend(self.owner, vec, keep=1.0 - w)
+                    self.owner_sec += sec
+                    logger.info("owner enroll %.1f/%.1fs", self.owner_sec, OWNER_ENROLL_SEC)
+            return True
+        if vec is None:
+            # Too short to verify: partials wait for more audio, a short final cannot be trusted.
+            return not final
+        score = float(np.dot(vec, self.owner))
+        if score < OWNER_MIN:
+            logger.info("owner DROP score=%.3f", score)
+            return False
+        if final and score >= OWNER_ADAPT:
+            self.owner = blend(self.owner, vec, keep=0.92)
+        logger.info("owner PASS score=%.3f", score)
+        return True
 
     def accept(self, audio: np.ndarray) -> list[tuple[str, bool, str]]:
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -89,12 +132,21 @@ class DuoMic:
         self._since = 0
         self._utt_label = ""
         self._shown = ""
+        self._utt_rejected = False
 
     def _emit(self, audio: np.ndarray, final: bool) -> list[tuple[str, bool, str]]:
         text = _zipformer_text(audio, SR)
         if not text and not final:
             return []
         vec = embed_f32(audio) if audio.size >= int(SR * 1.0) else None
+        if self._utt_rejected or not self._owner_allows(vec, audio.size, final):
+            # Once a voice fails the filter, the rest of that utterance stays hidden.
+            self._utt_rejected = not final
+            events = [("", True, self._shown)] if self._shown else []
+            self._shown = ""
+            if final:
+                logger.info("script dropped (not the camera person) %r", text)
+            return events
         if self._utt_label:
             label = self._utt_label
         else:
