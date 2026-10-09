@@ -57,6 +57,7 @@ class FaceCue:
     frontal_score: float = 0.0
     speaker: str = ""
     face_bgr: Optional[np.ndarray] = field(default=None, repr=False)
+    face_emb: Optional[np.ndarray] = field(default=None, repr=False)
 
 
 def _blend_map(categories) -> dict[str, float]:
@@ -318,6 +319,7 @@ class FaceMouthTracker:
                 speaker=track["label"],
                 face_bgr=face_bgr,
             )
+            cue.face_emb = self._face_identity(bgr, face, w, h, track, now)
             cues.append(cue)
             people.append(
                 {
@@ -351,6 +353,21 @@ class FaceMouthTracker:
             except Exception:
                 pass
         return active
+
+    def _face_identity(self, bgr, face, w: int, h: int, track: dict, now: float) -> Optional[np.ndarray]:
+        """ArcFace vector for this track, refreshed twice a second."""
+        if now - track.get("emb_at", 0.0) < 0.5 and track.get("face_emb") is not None:
+            return track["face_emb"]
+        try:
+            from app.faceid import five_points, get_face_embedder
+
+            vec = get_face_embedder().embed(bgr, five_points(face, w, h))
+        except Exception:
+            logger.exception("face embedding failed")
+            vec = None
+        if vec is not None:
+            track["face_emb"], track["emb_at"] = vec, now
+        return track.get("face_emb")
 
     def _reset_motion(self) -> None:
         self._hp_hist.clear()

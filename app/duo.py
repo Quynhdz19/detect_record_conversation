@@ -61,6 +61,28 @@ class DuoMic:
         self.owner: np.ndarray | None = None
         self.owner_sec = 0.0
         self._utt_rejected = False
+        # One voiceprint per face, so talking to A, then B, then A again keeps each filter.
+        self.person = ""
+        self._next_person = ""
+        self._voices: dict[str, tuple[np.ndarray | None, float]] = {}
+
+    def set_person(self, name: str) -> None:
+        """Switch the voice filter to the face now in front of the camera, between utterances only."""
+        if not name or name == self.person:
+            self._next_person = ""
+            return
+        if self._utt.size:
+            self._next_person = name
+            return
+        self._switch(name)
+
+    def _switch(self, name: str) -> None:
+        if self.person:
+            self._voices[self.person] = (self.owner, self.owner_sec)
+        self.owner, self.owner_sec = self._voices.get(name, (None, 0.0))
+        logger.info("person %s -> %s (voice %.1fs)", self.person or "-", name, self.owner_sec)
+        self.person = name
+        self._next_person = ""
 
     @property
     def owner_ready(self) -> bool:
@@ -133,6 +155,8 @@ class DuoMic:
         self._utt_label = ""
         self._shown = ""
         self._utt_rejected = False
+        if self._next_person:
+            self._switch(self._next_person)
 
     def _emit(self, audio: np.ndarray, final: bool) -> list[tuple[str, bool, str]]:
         text = _zipformer_text(audio, SR)
@@ -147,7 +171,9 @@ class DuoMic:
             if final:
                 logger.info("script dropped (not the camera person) %r", text)
             return events
-        if self._utt_label:
+        if self.person:
+            label = self.person
+        elif self._utt_label:
             label = self._utt_label
         else:
             label = _decide(vec, self.prints, self._last, audio.size)

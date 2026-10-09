@@ -199,7 +199,12 @@ async def ws_session(websocket: WebSocket):
     sample_rate = SAMPLE_RATE
     live = LiveStream(sr=sample_rate)
     duo = DuoMic()
-    owner_shown: tuple[bool, int] | None = None
+    owner_shown: tuple[str, bool, int] | None = None
+    from app.faceid import FaceBook
+
+    faces = FaceBook()
+    face_person = ""
+    last_face_emb = None
     last_face: dict[str, Any] = {"found": False, "lip_active": False}
     last_lip_at = 0.0
     mouth_open = False
@@ -497,6 +502,9 @@ async def ws_session(websocket: WebSocket):
                 except Exception:
                     logger.exception("face frame failed")
                     continue
+                if cue.found and cue.face_emb is not None and cue.face_emb is not last_face_emb:
+                    last_face_emb = cue.face_emb
+                    face_person = faces.identify(cue.face_emb)
                 synced = _talknet_says_speaking()
                 talking = bool(cue.found and cue.lip_active and synced)
                 if talking:
@@ -511,6 +519,7 @@ async def ws_session(websocket: WebSocket):
                     "w": cue.w,
                     "h": cue.h,
                     "speaker": cue.speaker or "",
+                    "person": face_person if cue.found else "",
                 }
                 people = []
                 for person in get_tracker().people:
@@ -548,7 +557,8 @@ async def ws_session(websocket: WebSocket):
                 mouth_open = True
                 preroll = []
 
-                def _hear(chunk: np.ndarray = audio) -> list:
+                def _hear(chunk: np.ndarray = audio, who: str = face_person) -> list:
+                    duo.set_person(who)
                     return duo.accept(chunk)
 
                 events = await loop.run_in_executor(None, _hear)
@@ -561,16 +571,17 @@ async def ws_session(websocket: WebSocket):
                 while sum(p.size for p in preroll) > int(SAMPLE_RATE * PREROLL_SEC):
                     preroll.pop(0)
                 continue
-            owner_now = (duo.owner_ready, round(duo.owner_sec))
+            owner_now = (duo.person, duo.owner_ready, round(duo.owner_sec))
             if owner_now != owner_shown:
                 owner_shown = owner_now
+                who = duo.person or "người này"
                 label = (
-                    "Giọng đã đăng ký: chỉ nhận người này"
+                    f"{who}: giọng đã đăng ký"
                     if duo.owner_ready
-                    else f"Đang đăng ký giọng {duo.owner_sec:.0f}/{OWNER_ENROLL_SEC:.0f}s"
+                    else f"{who}: đang đăng ký giọng {duo.owner_sec:.0f}/{OWNER_ENROLL_SEC:.0f}s"
                 )
                 await websocket.send_json({"type": "status", "text": label})
-            for text, is_final, _speaker in events:
+            for text, is_final, speaker in events:
                 text = clean_transcript(text, final=is_final, allow_greetings=is_final)
                 if not text:
                     if is_final:
@@ -580,7 +591,7 @@ async def ws_session(websocket: WebSocket):
                                 "text": "",
                                 "final": True,
                                 "used_tse": False,
-                                "speaker": "",
+                                "speaker": speaker,
                             }
                         )
                     continue
@@ -590,7 +601,7 @@ async def ws_session(websocket: WebSocket):
                         "text": text,
                         "final": is_final,
                         "used_tse": False,
-                        "speaker": "",
+                        "speaker": speaker,
                     }
                 )
 
