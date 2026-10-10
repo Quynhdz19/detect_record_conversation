@@ -27,6 +27,8 @@ NEW_VOICE = 0.30
 SWITCH_MARGIN = 0.06
 # Only fold a clip into a voiceprint when it clearly is that person.
 ENROLL_SCORE = 0.50
+# Voice enrollment and the voice filter. Off: every lip-gated utterance is transcribed.
+VOICE_REGISTER = os.environ.get("VOICE_REGISTER", "1") == "1"
 # The owner is whoever speaks through the lip gate first; this much of their speech builds the filter.
 OWNER_ENROLL_SEC = float(os.environ.get("OWNER_ENROLL_SEC", "4.0"))
 OWNER_CLIP_SEC = 1.5
@@ -46,10 +48,10 @@ class DuoMic:
         config.silero_vad.threshold = 0.5
         config.silero_vad.min_silence_duration = 0.7
         config.silero_vad.min_speech_duration = 0.25
-        config.silero_vad.max_speech_duration = 15
+        config.silero_vad.max_speech_duration = 45
         config.sample_rate = SR
         config.provider = "cpu"
-        self._vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=30)
+        self._vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=60)
         self._window = 512
         self._pending = np.zeros(0, dtype=np.float32)
         self._utt = np.zeros(0, dtype=np.float32)
@@ -91,9 +93,32 @@ class DuoMic:
     def reset_owner(self) -> None:
         self.owner = None
         self.owner_sec = 0.0
+        if self.person:
+            self._voices.pop(self.person, None)
+
+    def _voice_face(self, vec: np.ndarray) -> str:
+        """The face this voice is already registered to, if the match is clear."""
+        best_name, best = "", -1.0
+        known = dict(self._voices)
+        if self.person:
+            known[self.person] = (self.owner, self.owner_sec)
+        for name, (emb, sec) in known.items():
+            if not name or emb is None or sec < OWNER_CLIP_SEC:
+                continue
+            score = float(np.dot(vec, emb))
+            if score > best:
+                best_name, best = name, score
+        return best_name if best >= OWNER_MIN else ""
 
     def _owner_allows(self, vec: np.ndarray | None, n_samples: int, final: bool) -> bool:
-        """Enroll the first lip-gated speaker, then only let that voice through."""
+        """Register this face's voice, then only let that same voice through."""
+        if not VOICE_REGISTER or not self.person:
+            return True
+        if vec is not None:
+            owner_face = self._voice_face(vec)
+            if owner_face and owner_face != self.person:
+                logger.info("voice of %s blocked on %s", owner_face, self.person)
+                return False
         sec = n_samples / SR
         if not self.owner_ready:
             if final and vec is not None and sec >= OWNER_CLIP_SEC:
@@ -103,7 +128,10 @@ class DuoMic:
                     w = sec / (self.owner_sec + sec)
                     self.owner = vec if self.owner is None else blend(self.owner, vec, keep=1.0 - w)
                     self.owner_sec += sec
-                    logger.info("owner enroll %.1f/%.1fs", self.owner_sec, OWNER_ENROLL_SEC)
+                    self._voices[self.person] = (self.owner, self.owner_sec)
+                    logger.info(
+                        "enroll %s %.1f/%.1fs", self.person, self.owner_sec, OWNER_ENROLL_SEC
+                    )
             return True
         if vec is None:
             # Too short to verify: partials wait for more audio, a short final cannot be trusted.
@@ -114,7 +142,8 @@ class DuoMic:
             return False
         if final and score >= OWNER_ADAPT:
             self.owner = blend(self.owner, vec, keep=0.92)
-        logger.info("owner PASS score=%.3f", score)
+            self._voices[self.person] = (self.owner, self.owner_sec)
+        logger.info("owner PASS %s score=%.3f", self.person, score)
         return True
 
     def accept(self, audio: np.ndarray) -> list[tuple[str, bool, str]]:

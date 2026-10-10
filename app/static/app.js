@@ -6,7 +6,6 @@
   const listenBtn = document.getElementById("listenBtn");
   const stopBtn = document.getElementById("stopBtn");
   const flushBtn = document.getElementById("flushBtn");
-  const ownerBtn = document.getElementById("ownerBtn");
   const meta = document.getElementById("meta");
   const banner = document.getElementById("banner");
   const transcriptEl = document.getElementById("transcript");
@@ -355,7 +354,7 @@
     frameTimer = setInterval(() => {
       sendVideoFrame().catch(() => {});
     }, 125);
-    setBanner("Nhìn camera. Môi động thì chữ mới hiện.", "ok");
+    setBanner("Nhìn camera. Người gần nhất nói thì giọng tự đăng ký.", "ok");
   }
 
   function stopAll() {
@@ -421,12 +420,6 @@
   flushBtn.addEventListener("click", () => {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "flush" }));
-    }
-  });
-  ownerBtn.addEventListener("click", () => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "reset_owner" }));
-      setBanner("Đã xoá giọng. Người trước camera nói vài câu để đăng ký lại.", "ok");
     }
   });
   requireSpeaking.addEventListener("change", () => {

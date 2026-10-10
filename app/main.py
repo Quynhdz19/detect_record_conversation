@@ -39,7 +39,7 @@ from app.pi_api import router as pi_router
 from app.video_pipeline import TMP_ROOT, process_mp4
 from app.vision import get_tracker
 from app.denoise import denoise_pcm16
-from app.duo import OWNER_ENROLL_SEC, DuoMic
+from app.duo import OWNER_ENROLL_SEC, VOICE_REGISTER, DuoMic
 from app.voice import assign_speaker, blend, embed_pcm16, get_extractor, match_voice
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -47,8 +47,11 @@ logger = logging.getLogger(__name__)
 _face_lock = threading.Lock()
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-# TalkNet needs ~1 s of lips before it confirms speech; keep that audio so the first word survives.
-PREROLL_SEC = 1.0
+# TalkNet needs more than a second before it confirms speech. Keep the start of the sentence.
+PREROLL_SEC = 2.5
+# Once the mouth has opened the mic, a blink of TalkNet must not cut the sentence.
+GATE_TAIL_SEC = 1.0
+SPEECH_RMS = 0.012
 
 
 def _talknet_says_speaking() -> bool:
@@ -207,6 +210,7 @@ async def ws_session(websocket: WebSocket):
     last_face_emb = None
     last_face: dict[str, Any] = {"found": False, "lip_active": False}
     last_lip_at = 0.0
+    last_voice_at = 0.0
     mouth_open = False
     preroll: list[np.ndarray] = []
     require_speaking = True
@@ -482,9 +486,6 @@ async def ws_session(websocket: WebSocket):
                                     "speaker": speaker,
                                 }
                             )
-                elif msg_type == "reset_owner":
-                    duo.reset_owner()
-                    owner_shown = None
                 continue
 
             raw = message.get("bytes")
@@ -547,13 +548,18 @@ async def ws_session(websocket: WebSocket):
                 get_tracker().note_pcm16(payload)
             except Exception:
                 logger.exception("TalkNet audio feed failed")
-            # Only the mouth in frame may open the mic. A closed mouth drops the sound.
-            lips_now = last_lip_at > 0 and (time.time() - last_lip_at) < 0.45
-            if lips_now:
+            # The mouth in frame opens the mic. After that, real speech keeps the sentence whole.
+            now = time.time()
+            rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+            if rms >= SPEECH_RMS:
+                last_voice_at = now
+            lips_now = last_lip_at > 0 and (now - last_lip_at) < 0.45
+            sentence_on = mouth_open and (now - last_voice_at) < GATE_TAIL_SEC
+            if lips_now or sentence_on:
                 if not mouth_open:
                     logger.info("mouth gate open (asd=%.2f)", last_face.get("asd_score", 0.0))
                     head = preroll + [audio]
-                    audio = np.concatenate(head)
+                    audio = np.concatenate(head) if head else audio
                 mouth_open = True
                 preroll = []
 
@@ -572,7 +578,7 @@ async def ws_session(websocket: WebSocket):
                     preroll.pop(0)
                 continue
             owner_now = (duo.person, duo.owner_ready, round(duo.owner_sec))
-            if owner_now != owner_shown:
+            if VOICE_REGISTER and owner_now != owner_shown:
                 owner_shown = owner_now
                 who = duo.person or "người này"
                 label = (
