@@ -158,6 +158,7 @@ class FaceMouthTracker:
         self._prev_mouth: Optional[np.ndarray] = None
         self._prev_cheek: Optional[np.ndarray] = None
         self._last_loud_at = 0.0
+        self._active_label = ""
         self._last_audio_at = 0.0
         self._speak_hold = 0
         self._box_ema: Optional[np.ndarray] = None
@@ -340,8 +341,13 @@ class FaceMouthTracker:
             for cue in cues
             if cue.speaker and cue.face_bgr is not None
         }
-        # The script follows the person facing the camera, not a side face whose lips move.
-        active = max(cues, key=lambda c: c.frontal_score * c.w * c.h)
+        # The person nearest the camera (largest face) owns the mic, its voice filter and enrollment.
+        # The current owner keeps it until someone else is clearly closer, so similar sizes don't flicker.
+        active = max(cues, key=lambda c: c.w * c.h)
+        held = next((c for c in cues if c.speaker == self._active_label), None)
+        if held is not None and active.w * active.h < 1.2 * held.w * held.h:
+            active = held
+        self._active_label = active.speaker
         if active.face_bgr is not None:
             try:
                 from app.asd import get_talknet, talknet_ready

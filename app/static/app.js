@@ -82,28 +82,6 @@
     const w = video.clientWidth;
     const h = video.clientHeight;
     ctx.clearRect(0, 0, w, h);
-    const people = face && face.people && face.people.length
-      ? face.people
-      : face && face.found ? [face] : [];
-    if (!w || !people.length) return;
-    const palette = { A: "#1f8f4e", B: "#2f6fed", C: "#c47b2b" };
-    for (const person of people) {
-      const color = palette[person.speaker] || "#f0c14b";
-      const x = person.x * w;
-      const y = person.y * h;
-      const bw = person.w * w;
-      const bh = person.h * h;
-      ctx.strokeStyle = person.speaking ? color : "#f0c14b";
-      ctx.lineWidth = 3;
-      ctx.strokeRect(x, y, bw, bh);
-      ctx.fillStyle = person.speaking ? color + "22" : "rgba(240,193,75,0.12)";
-      ctx.fillRect(x, y, bw, bh);
-      if (person.speaker) {
-        ctx.fillStyle = color;
-        ctx.font = "700 16px sans-serif";
-        ctx.fillText(person.speaker, x + 6, Math.max(18, y - 6));
-      }
-    }
   }
 
   function downsampleTo16k(float32, inputRate) {
